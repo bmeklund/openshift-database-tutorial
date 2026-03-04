@@ -1,0 +1,87 @@
+= Workshop overview
+
+include::partial$_attributes.adoc[]
+
+== Workshop scenario
+
+You are a senior platform engineer at DataStore Inc, a retail analytics company that has been running PostgreSQL databases on virtual machines for over a decade.
+
+DataStore Inc is migrating from on-prem VMs to Red Hat OpenShift. Your CTO has issued a mandate: "Our VM-based databases are slowing us down. Provisioning takes weeks, scaling requires hardware orders, and disaster recovery is a manual nightmare. We need to modernize."
+
+*Your assignment*: Evaluate and implement PostgreSQL on OpenShift, prove it is production-ready, and document the path for the rest of the team.
+
+*The objective*: Migrate DataStore Inc's PostgreSQL workloads from VMs to OpenShift without sacrificing reliability, performance, or data integrity.
+
+== Success criteria
+
+By the end of this workshop, you will be able to:
+
+* Explain how OpenShift manages persistent storage for stateful workloads and how it differs from VM-based databases → *make informed architecture decisions*
+* Deploy a production-ready PostgreSQL {postgresql_version} instance on OpenShift with persistent storage → *replace the VM-based database*
+* Configure resource limits, health checks, and credential management → *meet DataStore Inc's reliability standards*
+* Implement high availability with StatefulSets and Pod Disruption Budgets → *survive node failures without data loss*
+* Execute backup and restore operations using volume snapshots → *meet RPO/RTO requirements*
+
+*Technical outcome*: A running, highly available PostgreSQL {postgresql_version} cluster on OpenShift with automated backups.
+
+*Business benefit*: Database provisioning time reduced from weeks to minutes, with built-in HA and repeatable infrastructure.
+
+== Target audience
+
+This workshop is designed for:
+
+* Developers building data-driven applications on OpenShift
+* DBAs evaluating Kubernetes-based database management
+* Platform engineers migrating stateful workloads from VMs to containers
+* Anyone responsible for production database operations on Red Hat OpenShift
+
+== What you need to succeed
+
+You should have:
+
+* Basic Linux command line experience (you have used a terminal before)
+* Basic understanding of relational databases (you know what SELECT and INSERT do)
+* No prior OpenShift or Kubernetes experience required
+
+== DataStore Inc's current challenges
+
+*The situation*: DataStore Inc runs 15 PostgreSQL instances on VMs across 3 data centers. Each VM reserves dedicated resources that sit idle 60% of the time.
+
+*Current pain points*:
+
+* *Slow provisioning*: A new database VM takes 2 to 3 weeks from request to production → blocks feature development
+* *Resource waste*: Each VM reserves 16 GB RAM and 8 vCPUs regardless of actual load → 60% average utilization
+* *Manual HA*: Replication and failover are configured by hand → a DBA must be available 24/7 for failovers
+* *Backup complexity*: pg_dump scripts run on cron jobs → inconsistent timing, no coordination with storage snapshots
+* *No self-service*: Developers must file tickets for each new database → days of wait time for dev environments
+
+*The opportunity*: OpenShift provides self-service database provisioning, built-in HA, storage snapshots, and resource efficiency that addresses all 5 pain points.
+
+== Your vision of success
+
+If this migration succeeds, DataStore Inc will have:
+
+*Immediate improvements* (this workshop):
+
+* *Minutes to provision*: New PostgreSQL instances deployed from YAML in under 5 minutes → dev teams unblocked
+* *Automated HA*: Pod Disruption Budgets and StatefulSet replicas handle node failures automatically → no 24/7 on-call for failover
+
+*Strategic benefits* (next quarter):
+
+* *Resource efficiency*: Kubernetes bin-packing means 3x more databases per server → reduced infrastructure cost
+* *Developer self-service*: Operators let developers provision databases without DBA intervention → faster feature delivery
+* *Cloud-native backups*: VolumeSnapshots integrate with DR pipelines → reliable RPO targets met
+
+== Common questions
+
+*"Aren't containers ephemeral? What about my data?"*
+→ Persistent Volume Claims (PVCs) give PostgreSQL durable storage independent of pod lifecycle. Module 2 covers this in detail.
+
+*"How does this compare to our VM-based PostgreSQL in terms of performance?"*
+→ Module 1 addresses the performance and latency trade-offs directly, including when OpenShift matches or exceeds VM performance.
+
+*"What happens when a node goes down?"*
+→ Module 4 simulates a node failure and shows OpenShift's automated recovery firsthand.
+
+*"Is this production-ready or just a proof of concept?"*
+→ Every configuration in this workshop follows Red Hat production guidance for stateful database workloads on OpenShift.

@@ -2,18 +2,11 @@ name: github pages
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'content/**'
-      - 'site.yml'
-      - '.github/workflows/gh-pages.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'content/**'
-      - 'site.yml'
-      - '.github/workflows/gh-pages.yml'
+    branches:
+      - main
   workflow_dispatch:
+env:
+  SITE_DIR: "gh-pages"
 
 permissions:
   contents: read
@@ -35,14 +28,15 @@ jobs:
         with:
           node-version: '20'
       - name: install antora
-        run: npm i -g @antora/cli@3.1 @antora/site-generator@3.1 @sntke/antora-mermaid-extension@0.0.9
+        run: npm i -g @antora/cli@3.1 @antora/site-generator@3.1
       - name: antora generate
         run: antora --fetch site.yml
       - name: upload pages artifact
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
-          path: www
+          name: site
+          path: "${{ github.workspace }}/${{ env.SITE_DIR }}"
   deploy:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: build
@@ -51,6 +45,15 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-    - name: deploy github pages
-      id: deployment
-      uses: actions/deploy-pages@v4
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Download generated site
+        uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: "${{ github.workspace }}/${{ env.SITE_DIR }}"
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: site

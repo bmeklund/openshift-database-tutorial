@@ -1,0 +1,7 @@
+// Runtime variable mappings — resolved by Showroom at deploy time
+// ocp_version and postgresql_version are defined in antora.yml
+:console_url: {openshift_console_url}
+:api_url: {openshift_api_url}
+:user: {user}
+:password: {password}
+:namespace: {user}-database

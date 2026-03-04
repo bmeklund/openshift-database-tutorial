@@ -1,5 +1,12 @@
 name: modules
-title: Showroom Collection
+title: Deploying databases on OpenShift
 version: ~
+start_page: index.adoc
 nav:
   - modules/ROOT/nav.adoc
+
+asciidoc:
+  attributes:
+    lab_name: deploying-databases-openshift
+    ocp_version: '4.20'
+    postgresql_version: '16'

@@ -1,0 +1,752 @@
+= Module 2: Deploy and connect PostgreSQL
+
+include::partial$_attributes.adoc[]
+
+DataStore Inc's evaluation is complete: OpenShift is the right choice for the PostgreSQL migration. The latency overhead is acceptable, the storage primitives are production-ready, and the HA automation eliminates the 24/7 on-call requirement.
+
+Now you have a mandate to deploy the first real PostgreSQL {postgresql_version} instance on OpenShift. This is the instance that will eventually replace the primary VM-based database serving DataStore Inc's retail analytics application.
+
+In this module, you will create the credentials Secret, deploy PostgreSQL using a StatefulSet with a PersistentVolumeClaim, create a Service for connectivity, and verify that data persists across pod restarts.
+
+== Learning objectives
+
+By the end of this module, you will be able to:
+
+* Store database credentials securely in a Kubernetes Secret and inject them into a pod as environment variables
+* Deploy PostgreSQL {postgresql_version} using a StatefulSet with a PersistentVolumeClaim for durable storage
+* Create a headless Service to provide a stable DNS name for the database pod
+* Connect a psql client to the running database and execute SQL queries
+* Verify that data written to PostgreSQL survives a pod restart
+
+[#exercise-1-deploy-postgresql-with-persistent-storage]
+== Exercise 1: Deploy PostgreSQL with persistent storage
+
+Your first task is to get PostgreSQL running on OpenShift with durable storage. You will create the credentials Secret first, then the Service, then the StatefulSet — in that order, because the StatefulSet references both.
+
+. Confirm you are in the correct namespace:
++
+[source,bash]
+----
+oc project {user}-database
+----
++
+[source,text]
+----
+Now using project "{user}-database".
+----
+
+. Create the credentials Secret. This Secret stores the database username, password, and database name. The StatefulSet will inject these as environment variables into the PostgreSQL pod:
++
+[source,bash]
+----
+oc create secret generic postgres-credentials \
+  --from-literal=POSTGRESQL_USER=datastore_app \
+  --from-literal=POSTGRESQL_PASSWORD=DataStore2024! \
+  --from-literal=POSTGRESQL_DATABASE=datastore_prod \
+  -n {user}-database
+----
++
+[source,text]
+----
+secret/postgres-credentials created
+----
++
+[NOTE]
+====
+In production, generate the password with a tool such as `openssl rand -base64 32`. Never commit Secrets to Git — use a Secrets management solution such as HashiCorp Vault or the OpenShift Secrets Store CSI Driver for production workloads.
+====
+
+. Create the headless Service. Setting `clusterIP: None` gives each StatefulSet pod a stable DNS name (`postgres-0.postgres.{user}-database.svc.cluster.local`) that other pods can use to connect:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: {user}-database
+  labels:
+    app: postgres
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+EOF
+----
++
+[source,text]
+----
+service/postgres created
+----
+
+. Deploy PostgreSQL using a StatefulSet with a PersistentVolumeClaim template. The `volumeClaimTemplates` section automatically provisions a 10 Gi PVC named `data-postgres-0` when the pod starts:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: {user}-database
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: postgres
+        image: registry.redhat.io/rhel9/postgresql-{postgresql_version}:latest
+        env:
+        - name: POSTGRESQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_USER
+        - name: POSTGRESQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_PASSWORD
+        - name: POSTGRESQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_DATABASE
+        ports:
+        - containerPort: 5432
+          name: postgres
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        readinessProbe:
+          exec:
+            command:
+            - /usr/libexec/check-container
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 3
+        livenessProbe:
+          exec:
+            command:
+            - /usr/libexec/check-container
+            - --live
+          initialDelaySeconds: 120
+          periodSeconds: 10
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/pgsql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: gp3-csi-retain
+      resources:
+        requests:
+          storage: 10Gi
+EOF
+----
++
+[source,text]
+----
+statefulset.apps/postgres created
+----
++
+[NOTE]
+====
+`storageClassName: gp3-csi-retain` uses the Retain reclaim policy. If the PVC is deleted, the underlying volume is *not* automatically destroyed — it transitions to `Released` status and must be removed manually. This prevents accidental data loss. The default `gp3-csi` StorageClass uses the Delete policy, which permanently destroys the volume when the PVC object is removed.
+====
+
+. Watch the pod start up. The readiness probe checks that PostgreSQL is accepting connections before marking the pod ready:
++
+[source,bash]
+----
+oc get pods -w -n {user}-database
+----
++
+[source,text]
+----
+NAME         READY   STATUS              RESTARTS   AGE
+postgres-0   0/1     ContainerCreating   0          10s
+postgres-0   0/1     Running             0          20s
+postgres-0   1/1     Running             0          35s
+----
++
+Press `Ctrl+C` to stop watching once `postgres-0` shows `1/1 Running`.
+
+=== Verify
+
+Confirm the StatefulSet, pod, and PVC are all healthy:
+
+[source,bash]
+----
+oc get statefulset,pod,pvc -n {user}-database
+----
+
+[source,text]
+----
+NAME                        READY   AGE
+statefulset.apps/postgres   1/1     2m
+
+NAME             READY   STATUS    RESTARTS   AGE
+pod/postgres-0   1/1     Running   0          2m
+
+NAME                               STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+persistentvolumeclaim/data-postgres-0   Bound    pvc-a1b2c3d4-0000-0000-0000-000000000000   10Gi       RWO            gp3-csi-retain   2m
+----
+
+PostgreSQL is running with a bound PVC. Move on to Exercise 2 to create the schema and insert data.
+
+[#exercise-2-connect-to-the-database-and-create-the-schema]
+== Exercise 2: Connect to the database and create the schema
+
+DataStore Inc's retail analytics application tracks product inventory across 50 stores. You need to create the initial `products` table so the application team can start their integration tests.
+
+. Check the PostgreSQL logs to confirm the database initialized cleanly:
++
+[source,bash]
+----
+oc logs postgres-0 -n {user}-database | tail -5
+----
++
+[source,text]
+----
+2026-03-03 10:00:00.000 UTC [1] LOG:  starting PostgreSQL 16.x on x86_64-redhat-linux-gnu
+2026-03-03 10:00:00.100 UTC [1] LOG:  listening on IPv4 address "0.0.0.0", port 5432
+2026-03-03 10:00:00.200 UTC [1] LOG:  database system was shut down at 2026-03-03 09:59:00 UTC
+2026-03-03 10:00:00.300 UTC [1] LOG:  database system is ready to accept connections
+----
+
+. Open an interactive psql session inside the pod:
++
+[source,bash]
+----
+oc exec -it postgres-0 -n {user}-database -- psql -U datastore_app -d datastore_prod
+----
++
+[source,text]
+----
+psql (16.x)
+Type "help" for help.
+
+datastore_prod=>
+----
+
+. Check the PostgreSQL version and verify you are connected to the correct database:
++
+[source,sql]
+----
+SELECT version();
+SELECT current_database(), current_user;
+----
++
+[source,text]
+----
+                                                   version
+-------------------------------------------------------------------------------------------------------------
+ PostgreSQL 16.x on x86_64-redhat-linux-gnu, compiled by gcc (GCC) 11.x, 64-bit
+
+ current_database | current_user
+------------------+--------------
+ datastore_prod   | datastore_app
+----
+
+. Create the products table for DataStore Inc's inventory system:
++
+[source,sql]
+----
+CREATE TABLE products (
+  id          SERIAL PRIMARY KEY,
+  sku         VARCHAR(50)    NOT NULL UNIQUE,
+  name        VARCHAR(200)   NOT NULL,
+  price       NUMERIC(10,2)  NOT NULL,
+  stock       INTEGER        NOT NULL DEFAULT 0,
+  created_at  TIMESTAMP      DEFAULT CURRENT_TIMESTAMP
+);
+----
++
+[source,text]
+----
+CREATE TABLE
+----
+
+. Insert sample inventory records:
++
+[source,sql]
+----
+INSERT INTO products (sku, name, price, stock) VALUES
+  ('DS-001', 'Wireless Headphones', 79.99, 150),
+  ('DS-002', 'USB-C Hub 7-Port',    49.99, 300),
+  ('DS-003', 'Mechanical Keyboard', 129.99, 75),
+  ('DS-004', 'Webcam HD 1080p',     59.99, 200);
+----
++
+[source,text]
+----
+INSERT 0 4
+----
+
+. Query the data to confirm the inserts succeeded:
++
+[source,sql]
+----
+SELECT id, sku, name, price, stock FROM products ORDER BY id;
+----
++
+[source,text]
+----
+ id |  sku   |         name          | price  | stock
+----+--------+-----------------------+--------+-------
+  1 | DS-001 | Wireless Headphones   |  79.99 |   150
+  2 | DS-002 | USB-C Hub 7-Port      |  49.99 |   300
+  3 | DS-003 | Mechanical Keyboard   | 129.99 |    75
+  4 | DS-004 | Webcam HD 1080p       |  59.99 |   200
+(4 rows)
+----
+
+. Exit the psql session:
++
+[source,sql]
+----
+\q
+----
+
+=== Verify
+
+Confirm the table and row count from outside the pod using a single non-interactive command:
+
+[source,bash]
+----
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod -c "SELECT COUNT(*) FROM products;"
+----
+
+[source,text]
+----
+ count
+-------
+     4
+(1 row)
+----
+
+4 products are in the database. Move on to Exercise 3 to verify data survives a pod restart.
+
+[#exercise-3-verify-data-persistence-across-pod-restarts]
+== Exercise 3: Verify data persistence across pod restarts
+
+This is the most important test for DataStore Inc's leadership: does data survive if the database pod is killed and rescheduled? On a VM, the database process and its data live on the same host — there is no separation. On OpenShift, the pod is ephemeral but the PVC is not.
+
+You will delete the pod, let the StatefulSet automatically recreate it, and confirm the data is still there.
+
+. Record the current pod creation time before the restart:
++
+[source,bash]
+----
+oc get pod postgres-0 -n {user}-database -o jsonpath='{.metadata.creationTimestamp}'
+echo ""
+----
++
+[source,text]
+----
+2026-03-03T10:00:00Z
+----
+
+. Delete the pod. The StatefulSet controller detects the missing pod and immediately schedules a replacement:
++
+[source,bash]
+----
+oc delete pod postgres-0 -n {user}-database
+----
++
+[source,text]
+----
+pod "postgres-0" deleted
+----
+
+. Watch the StatefulSet recreate the pod and mount the same PVC:
++
+[source,bash]
+----
+oc get pods -w -n {user}-database
+----
++
+[source,text]
+----
+NAME         READY   STATUS              RESTARTS   AGE
+postgres-0   0/1     Pending             0          2s
+postgres-0   0/1     ContainerCreating   0          4s
+postgres-0   0/1     Running             0          12s
+postgres-0   1/1     Running             0          27s
+----
++
+Press `Ctrl+C` when `postgres-0` is `1/1 Running`.
+
+. Confirm the new pod has a later creation time than the original:
++
+[source,bash]
+----
+oc get pod postgres-0 -n {user}-database -o jsonpath='{.metadata.creationTimestamp}'
+echo ""
+----
++
+[source,text]
+----
+2026-03-03T10:05:00Z
+----
+
+. Verify the PVC is still bound and attached to the new pod:
++
+[source,bash]
+----
+oc get pvc data-postgres-0 -n {user}-database
+----
++
+[source,text]
+----
+NAME               STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+data-postgres-0    Bound    pvc-a1b2c3d4-0000-0000-0000-000000000000   10Gi       RWO            gp3-csi        10m
+----
+
+. Query the products table in the new pod — the data must be there:
++
+[source,bash]
+----
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod \
+  -c "SELECT id, sku, name FROM products ORDER BY id;"
+----
++
+[source,text]
+----
+ id |  sku   |         name
+----+--------+----------------------
+  1 | DS-001 | Wireless Headphones
+  2 | DS-002 | USB-C Hub 7-Port
+  3 | DS-003 | Mechanical Keyboard
+  4 | DS-004 | Webcam HD 1080p
+(4 rows)
+----
+
+=== Verify
+
+Confirm the final state — a running pod, a bound PVC, and 4 rows of data intact:
+
+[source,bash]
+----
+oc get pod,pvc -n {user}-database
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod -c "SELECT COUNT(*) FROM products;"
+----
+
+[source,text]
+----
+NAME             READY   STATUS    RESTARTS   AGE
+pod/postgres-0   1/1     Running   0          3m
+
+NAME                            STATUS   VOLUME                 CAPACITY   ACCESS MODES
+persistentvolumeclaim/data-postgres-0   Bound    pvc-a1b2c3d4...   10Gi       RWO
+
+ count
+-------
+     4
+(1 row)
+----
+
+All 4 products survived the pod restart. The PVC outlasted the pod — exactly as designed.
+
+[#exercise-4-deploy-postgresql-using-the-cloudnativepg-operator]
+== Exercise 4: Deploy PostgreSQL using the CloudNativePG operator
+
+DataStore Inc's CTO wants a production-grade operator-managed deployment as the long-term target. Exercises 1 through 3 showed what it takes to wire everything together manually: a Secret, a StatefulSet, a Service, and a PVC. The CloudNativePG operator automates all of that from a single `Cluster` custom resource: pod management, Services, Secrets, and PVC provisioning are handled by the operator.
+
+This exercise deploys a CloudNativePG cluster alongside the StatefulSet you already have running, then removes it afterward. The production StatefulSet from Exercises 1-3 remains in place and is used in Modules 3-5.
+
+=== Learning objectives
+
+* Verify that the CloudNativePG operator is installed and ready
+* Deploy a PostgreSQL cluster using the `Cluster` custom resource
+* Observe what the operator creates automatically and compare it to the manual deployment
+* Connect to the operator-managed cluster and verify the database
+
+=== Step 1: Verify the CloudNativePG operator
+
+Confirm the CloudNativePG operator CSV is in `Succeeded` state in the `openshift-operators` namespace:
+
+[source,bash]
+----
+oc get csv -n openshift-operators | grep cloudnative
+----
+
+[source,text]
+----
+cloudnative-pg.v1.25.0   CloudNativePG   1.25.0   ...   Succeeded
+----
+
+The operator watches all namespaces, so it will respond to `Cluster` resources created in `{user}-database`.
+
+=== Step 2: Create a superuser credentials Secret
+
+The CloudNativePG operator uses a Secret with `username` and `password` keys for the PostgreSQL superuser. Create it now:
+
+[source,bash]
+----
+oc create secret generic datastore-cnpg-superuser \
+  --from-literal=username=postgres \
+  --from-literal=password=CNPGDataStore2024! \
+  -n {user}-database
+----
+
+[source,text]
+----
+secret/datastore-cnpg-superuser created
+----
+
+=== Step 3: Apply the Cluster custom resource
+
+Apply a minimal `Cluster` CR. The operator reads this resource and provisions everything needed:
+
+[source,bash]
+----
+cat <<EOF | oc apply -f -
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: datastore-cnpg
+  namespace: {user}-database
+spec:
+  instances: 1
+  bootstrap:
+    initdb:
+      database: datastore_prod
+      owner: datastore_app
+  storage:
+    storageClass: gp3-csi-retain
+    size: 5Gi
+  superuserSecret:
+    name: datastore-cnpg-superuser
+EOF
+----
+
+[source,text]
+----
+cluster.postgresql.cnpg.io/datastore-cnpg created
+----
+
+=== Step 4: Watch cluster initialization
+
+Watch the `Cluster` status until the phase reports a healthy state. This typically takes 60 to 90 seconds:
+
+[source,bash]
+----
+oc get cluster datastore-cnpg -n {user}-database -w
+----
+
+[source,text]
+----
+NAME             AGE   INSTANCES   READY   STATUS                     PRIMARY
+datastore-cnpg   10s   1           0       Setting up primary
+datastore-cnpg   45s   1           0       Initializing primary instance
+datastore-cnpg   75s   1           1       Cluster in healthy state    datastore-cnpg-1
+----
+
+Press `Ctrl+C` to stop watching once you see `Cluster in healthy state`.
+
+=== Step 5: Inspect what the operator created
+
+The operator created the pod, Services, PVC, and Secrets automatically. Inspect them:
+
+[source,bash]
+----
+oc get pods,svc,pvc,secret -l cnpg.io/cluster=datastore-cnpg -n {user}-database
+----
+
+[source,text]
+----
+NAME                   READY   STATUS    RESTARTS   AGE
+pod/datastore-cnpg-1   1/1     Running   0          2m
+
+NAME                          TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE
+service/datastore-cnpg-r      ClusterIP   10.96.45.12     <none>        5432/TCP   2m
+service/datastore-cnpg-ro     ClusterIP   10.96.45.13     <none>        5432/TCP   2m
+service/datastore-cnpg-rw     ClusterIP   10.96.45.14     <none>        5432/TCP   2m
+
+NAME                                      STATUS   VOLUME                 CAPACITY
+persistentvolumeclaim/datastore-cnpg-1   Bound    pvc-a1b2c3d4...        5Gi
+
+NAME                                TYPE     DATA   AGE
+secret/datastore-cnpg-app           Opaque   2      2m
+secret/datastore-cnpg-superuser     Opaque   2      3m
+----
+
+NOTE: CloudNativePG creates 3 Services automatically. `-rw` routes to the primary instance and accepts read and write queries. `-ro` routes to replica instances (read-only) and is used for read scaling. `-r` routes to any instance regardless of role. Applications always connect using the `-rw` Service for writes. The `-ro` Service is used for read replicas when more than one instance is deployed.
+
+=== Step 6: Connect and verify the database
+
+Connect to the CloudNativePG pod and run a query to confirm the database was created correctly:
+
+[source,bash]
+----
+oc exec -it datastore-cnpg-1 -n {user}-database -- \
+  psql -U postgres -d datastore_prod \
+  -c "SELECT current_user, current_database(), version();"
+----
+
+[source,text]
+----
+ current_user | current_database |                 version
+--------------+------------------+------------------------------------------
+ postgres     | datastore_prod   | PostgreSQL 16.x on x86_64-pc-linux-gnu...
+(1 row)
+----
+
+The operator bootstrapped `datastore_prod` and created the `datastore_app` owner role, the same outcome as Exercises 1 and 2 but from a single `Cluster` CR with no manual Service or PVC YAML.
+
+=== Verify
+
+Confirm the cluster status and primary pod name with a single `jsonpath` query:
+
+[source,bash]
+----
+oc get cluster datastore-cnpg -n {user}-database \
+  -o jsonpath='status={.status.phase}{"\n"}primary={.status.currentPrimary}{"\n"}'
+----
+
+[source,text]
+----
+status=Cluster in healthy state
+primary=datastore-cnpg-1
+----
+
+=== Cleanup
+
+Delete the Cluster CR and the superuser Secret before moving on. The production StatefulSet from Exercises 1-3 is still running and is used in Modules 3-5.
+
+[source,bash]
+----
+oc delete cluster datastore-cnpg -n {user}-database
+oc delete secret datastore-cnpg-superuser -n {user}-database
+----
+
+[source,text]
+----
+cluster.postgresql.cnpg.io "datastore-cnpg" deleted
+secret "datastore-cnpg-superuser" deleted
+----
+
+NOTE: The `gp3-csi-retain` StorageClass has a reclaim policy of `Retain`. After the Cluster CR is deleted the PVC moves to `Released` status and the underlying volume is not deleted. You must delete the PVC manually if you do not want it to persist:
+
+[source,bash]
+----
+oc delete pvc datastore-cnpg-1 -n {user}-database
+----
+
+== Troubleshooting
+
+*Issue*: Pod stays in `ContainerCreating` for more than 2 minutes
+
+*Solution*:
+
+. Check the pod events for the specific error:
++
+[source,bash]
+----
+oc describe pod postgres-0 -n {user}-database | grep -A 10 "Events:"
+----
+. Common causes: the PVC is not binding (check `oc get pvc`) or the image pull is failing (check registry authentication).
+
+*Issue*: Pod starts but readiness probe fails — pod stays `0/1 Running`
+
+*Solution*:
+
+. Check the PostgreSQL startup logs:
++
+[source,bash]
+----
+oc logs postgres-0 -n {user}-database
+----
+. The most common cause is a wrong `POSTGRESQL_USER`, `POSTGRESQL_PASSWORD`, or `POSTGRESQL_DATABASE` value in the Secret. Verify with:
++
+[source,bash]
+----
+oc get secret postgres-credentials -o jsonpath='{.data.POSTGRESQL_USER}' | base64 -d
+----
+
+*Issue*: `ImagePullBackOff` — cannot pull `registry.redhat.io/rhel9/postgresql-{postgresql_version}:latest`
+
+*Solution*:
+
+. This image requires a Red Hat registry pull secret. Check whether one is configured:
++
+[source,bash]
+----
+oc get secret pull-secret -n openshift-config
+----
+. In the lab environment, pull secrets are pre-configured. If the error persists, ask your facilitator.
+
+*Issue*: `psql: error: connection to server failed: FATAL: role "datastore_app" does not exist`
+
+*Solution*:
+
+. The database initialized with different credentials than expected. Check the Secret values, delete the StatefulSet and PVC, and redeploy:
++
+[source,bash]
+----
+oc delete statefulset postgres -n {user}-database
+oc delete pvc data-postgres-0 -n {user}-database
+oc delete secret postgres-credentials -n {user}-database
+----
+. Then repeat Exercise 1 from the beginning.
+
+*Issue*: `PersistentVolumeClaim is not bound` after StatefulSet creation
+
+*Solution*:
+
+. Check available StorageClasses and ensure `WaitForFirstConsumer` binding mode is supported:
++
+[source,bash]
+----
+oc get storageclass
+oc describe pvc data-postgres-0 -n {user}-database
+----
+. If no StorageClass has `ALLOWVOLUMEEXPANSION: true`, ask your facilitator for the correct StorageClass name to use in the StatefulSet's `volumeClaimTemplates`.
+
+== Module summary
+
+DataStore Inc now has a running PostgreSQL {postgresql_version} instance on OpenShift with durable storage. You confirmed the most important property of container-based databases: the pod is ephemeral, but the data is not.
+
+*What you accomplished:*
+
+* Created a Kubernetes Secret to store database credentials and inject them securely as environment variables — no passwords in YAML
+* Deployed PostgreSQL {postgresql_version} using a StatefulSet with a PersistentVolumeClaim — the database survives pod restarts
+* Created a headless Service providing stable DNS (`postgres-0.postgres.{user}-database.svc.cluster.local`) for application connectivity
+* Ran SQL queries via `oc exec` to create a schema, insert 4 products, and verify the data
+* Deleted the pod and confirmed that all 4 rows survived the restart — proving PVC-backed storage is durable
+
+*Key takeaways:*
+
+* Always create the Secret before the StatefulSet — the pod fails to start if a referenced Secret does not exist
+* `terminationGracePeriodSeconds: 60` allows PostgreSQL to complete its checkpoint write before the pod is killed — never set this below 30 seconds for production databases
+* The PVC name (`data-postgres-0`) is deterministic: `<volumeClaimTemplate name>-<StatefulSet name>-<ordinal>` — the new pod automatically mounts the same PVC as the deleted one
+* Readiness and liveness probes using `/usr/libexec/check-container` are specific to the Red Hat PostgreSQL image — they test actual database connectivity, not just process existence
+
+*Next steps:*
+
+Module 3 hardens the DataStore Inc deployment with proper resource limits, health check tuning, Security Context Constraints, and a backup strategy using VolumeSnapshots — the configuration changes that take this from a working deployment to a production-ready one.

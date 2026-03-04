@@ -1,0 +1,921 @@
+= Module 5: Connecting applications to databases
+
+include::partial$_attributes.adoc[]
+
+DataStore Inc's retail analytics API team is ready. They have a containerized application that reads from the PostgreSQL database and serves inventory data to the retail stores. The CTO wants to see the full stack running end to end — application pods connecting to the database pod — before the production cutover.
+
+In this module, you will deploy a stateless application Deployment that connects to the PostgreSQL instance from Module 2, inject credentials using the existing Secret, verify connectivity from multiple replicas, and manage the application lifecycle with rolling updates and graceful reconnection through database restarts.
+
+== Learning objectives
+
+By the end of this module, you will be able to:
+
+* Explain the difference between stateless and stateful applications and why only stateless applications scale freely on OpenShift
+* Deploy an application Deployment that connects to PostgreSQL using the Kubernetes Service DNS name and injected credentials
+* Verify that all application replicas can reach the database and perform both read and write operations
+* Scale the application independently of the database and trigger a zero-downtime rolling update
+* Observe application reconnection behavior after a database pod restart
+
+[#exercise-1-deploy-the-analytics-api-and-understand-stateless-vs-stateful-patterns]
+== Exercise 1: Deploy the analytics API and understand stateless vs. stateful patterns
+
+DataStore Inc's analytics API is stateless — it holds no data of its own. Every request reads from the database and returns a result. Any pod can handle any request, which means it can be scaled up or down freely. The PostgreSQL database is stateful — its data lives in a PVC that is tied to a specific pod. Scaling a stateful application requires coordination that a Deployment alone cannot provide.
+
+. Review the architectural difference before deploying. Create a ConfigMap documenting how the 2 tiers interact:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-architecture-reference
+  namespace: {user}-database
+data:
+  stateless-app.txt: |
+    STATELESS APPLICATION (DataStore Analytics API)
+    ================================================
+    - No per-pod state: any replica can handle any request
+    - Connects to the database on every request, holds no data
+    - Scales freely: oc scale deployment datastore-api --replicas=N
+    - Deployed as a Deployment (not StatefulSet): pods are interchangeable
+    - Rolling updates are zero-downtime: new pods start before old ones stop
+    - Crash recovery: scheduler replaces pod anywhere on the cluster
+    - PVC: none required
+    - Disaster recovery: traffic redirection only. Point the load balancer at a
+      second cluster running identical Deployment manifests and the app is recovered.
+      RTO is seconds. No storage coordination required.
+
+  stateful-app.txt: |
+    STATEFUL APPLICATION (PostgreSQL database)
+    ==========================================
+    - Per-pod state: data lives in a PVC bound to a specific pod name
+    - Pod identity matters: postgres-0 always mounts data-postgres-0
+    - Cannot scale freely: replicas need replication and primary election
+    - Deployed as a StatefulSet: pods have stable names and ordered startup
+    - Updates require care: StatefulSet rolls one pod at a time
+    - Crash recovery: same pod name reattaches to same PVC
+    - PVC: required (10Gi gp3-csi, bound to postgres-0)
+    - Storage type matters: gp3-csi is block storage -- single availability zone
+      only. The database pod is zone-affined to the node where the PVC is bound.
+      For multi-AZ resilience, use OpenShift Data Foundation (ODF), which provides
+      3-way synchronous replication across availability zones.
+    - Disaster recovery: state must be recovered, not just traffic redirected.
+      Two approaches: (1) backup/restore -- restore from a VolumeSnapshot, RPO
+      equals time since last snapshot, RTO equals restore + startup time;
+      (2) storage replication -- ODF Regional-DR replicates the PVC to a second
+      cluster asynchronously, RPO is near-zero, RTO is automated failover time.
+EOF
+----
++
+[source,text]
+----
+configmap/app-architecture-reference created
+----
+
+[NOTE]
+====
+*Storage is the primary challenge when containerizing stateful workloads.* The `gp3-csi` StorageClass used in this workshop provisions AWS EBS block volumes, which are single-availability-zone resources. If the node hosting `postgres-0` is in `us-east-1a`, the PVC is also in `us-east-1a` -- the database pod cannot be rescheduled to a node in a different AZ without losing access to its data. In production, distribute database nodes across multiple AZs and use OpenShift Data Foundation (ODF), which replicates data 3 ways across AZs synchronously. ODF also enables resource consolidation: instead of provisioning a dedicated EBS volume per database, multiple databases share a storage pool with guaranteed isolation.
+====
+
+. Create a ConfigMap containing the analytics API startup script. This script polls the products table every 30 seconds, simulating the request loop of a real inventory API:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datastore-api-scripts
+  namespace: {user}-database
+data:
+  api.sh: |
+    #!/bin/bash
+    echo "DataStore Inc Analytics API v1 starting"
+    echo "Database host : $PGHOST"
+    echo "Database name : $PGDATABASE"
+    echo "Database user : $PGUSER"
+
+    until psql -c "SELECT 1;" >/dev/null 2>&1; do
+      echo "$(date '+%H:%M:%S'): Waiting for database connection..."
+      sleep 5
+    done
+
+    echo "$(date '+%H:%M:%S'): Connected. Starting inventory poll."
+
+    while true; do
+      COUNT=$(psql -t -c "SELECT COUNT(*) FROM products;" 2>/dev/null | tr -d ' ')
+      if [ $? -eq 0 ]; then
+        echo "$(date '+%H:%M:%S'): $COUNT products in inventory"
+        psql -c "SELECT id, sku, name, price, stock FROM products ORDER BY id;"
+      else
+        echo "$(date '+%H:%M:%S'): Database connection lost. Retrying on next cycle."
+      fi
+      sleep 30
+    done
+EOF
+----
++
+[source,text]
+----
+configmap/datastore-api-scripts created
+----
+
+. Deploy the analytics API as a Deployment with 2 replicas. The Deployment uses the existing `postgres-credentials` Secret for database credentials and mounts the script ConfigMap:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datastore-api
+  namespace: {user}-database
+  labels:
+    app: datastore-api
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: datastore-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: datastore-api
+        version: v1
+    spec:
+      containers:
+      - name: api
+        image: registry.redhat.io/rhel9/postgresql-{postgresql_version}:latest
+        command: ["/bin/bash", "/scripts/api.sh"]
+        env:
+        - name: PGHOST
+          value: "postgres"
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_USER
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_PASSWORD
+        - name: PGDATABASE
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_DATABASE
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      volumes:
+      - name: scripts
+        configMap:
+          name: datastore-api-scripts
+          defaultMode: 0755
+EOF
+----
++
+[source,text]
+----
+deployment.apps/datastore-api created
+----
++
+[NOTE]
+====
+`PGHOST: postgres` uses the short DNS form. Because the Deployment and the PostgreSQL Service are both in the `{user}-database` namespace, Kubernetes resolves `postgres` to the Service's endpoints without needing the fully qualified `postgres.{user}-database.svc.cluster.local` name. `maxUnavailable: 0` and `maxSurge: 1` ensure the rolling update never removes a pod before a replacement is ready.
+
+The `until psql -c "SELECT 1;"` loop in `api.sh` is a simple database readiness gate. In production, use an `initContainers` entry instead -- it runs before the main container starts and exits with a non-zero code if the database is not yet ready, which prevents the application container from starting in an unusable state and keeps the pod in `Init:0/1` until the dependency is satisfied.
+
+This Deployment uses the PostgreSQL image as a convenient base that ships with `psql` and `bash`. In a real environment, the analytics API would use a Python, Go, or Node.js application image. The image choice does not affect the connectivity, scaling, or rolling update patterns demonstrated in this module.
+====
+
+[NOTE]
+====
+The workshop environment pre-provisions a pull secret for `registry.redhat.io` in your namespace. If you run this exercise outside the workshop, create one first: `oc create secret docker-registry redhat-registry --docker-server=registry.redhat.io --docker-username=<RHN_USERNAME> --docker-password=<RHN_PASSWORD> -n {user}-database`, then link it: `oc secrets link default redhat-registry --for=pull -n {user}-database`.
+====
+
+. Watch both replicas start:
++
+[source,bash]
+----
+oc get pods -l app=datastore-api -n {user}-database -w
+----
++
+[source,text]
+----
+NAME                             READY   STATUS              RESTARTS   AGE
+datastore-api-7d9f8b6c4-k2p9x   0/1     ContainerCreating   0          8s
+datastore-api-7d9f8b6c4-m7q3t   0/1     ContainerCreating   0          8s
+datastore-api-7d9f8b6c4-k2p9x   1/1     Running             0          18s
+datastore-api-7d9f8b6c4-m7q3t   1/1     Running             0          20s
+----
++
+Press `Ctrl+C` when both pods show `1/1 Running`.
+
+=== Verify
+
+Confirm the Deployment is healthy and both replicas are up:
+
+[source,bash]
+----
+oc get deployment datastore-api -n {user}-database
+----
+
+[source,text]
+----
+NAME            READY   UP-TO-DATE   AVAILABLE   AGE
+datastore-api   2/2     2            2           1m
+----
+
+`READY: 2/2` confirms both application replicas are running alongside the PostgreSQL pod. Move on to Exercise 2 to verify database connectivity.
+
+[#exercise-2-verify-database-connectivity-and-the-write-path]
+== Exercise 2: Verify database connectivity and the write path
+
+The Deployment is running, but you need to confirm that both replicas can actually reach the database — read data and write data. DataStore Inc's API must be able to insert new product records when the merchandising team adds inventory.
+
+. Check the logs from the first API pod to confirm it connected and is polling the products table:
++
+[source,bash]
+----
+oc logs -l app=datastore-api -n {user}-database --prefix --tail=15
+----
++
+[source,text]
+----
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] DataStore Inc Analytics API v1 starting
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] Database host : postgres
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] Database name : datastore_prod
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] Database user : datastore_app
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] 10:45:00: Connected. Starting inventory poll.
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] 10:45:00: 4 products in inventory
+[pod/datastore-api-7d9f8b6c4-k2p9x/api]  id |  sku   |         name          | price  | stock
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] ----+--------+-----------------------+--------+-------
+[pod/datastore-api-7d9f8b6c4-k2p9x/api]   1 | DS-001 | Wireless Headphones   |  79.99 |   150
+[pod/datastore-api-7d9f8b6c4-k2p9x/api]   2 | DS-002 | USB-C Hub 7-Port      |  49.99 |   300
+[pod/datastore-api-7d9f8b6c4-k2p9x/api]   3 | DS-003 | Mechanical Keyboard   | 129.99 |    75
+[pod/datastore-api-7d9f8b6c4-k2p9x/api]   4 | DS-004 | Webcam HD 1080p       |  59.99 |   200
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] (4 rows)
+[pod/datastore-api-7d9f8b6c4-k2p9x/api]
+[pod/datastore-api-7d9f8b6c4-k2p9x/api] 10:45:00: 4 products in inventory
+----
++
+The `--prefix` flag shows which pod each log line came from — both replicas log independently with the same data.
+
+. Capture the name of one API pod for the next steps:
++
+[source,bash]
+----
+API_POD=$(oc get pod -l app=datastore-api -n {user}-database \
+  -o jsonpath='{.items[0].metadata.name}')
+echo "Using pod: $API_POD"
+----
++
+[source,text]
+----
+Using pod: datastore-api-7d9f8b6c4-k2p9x
+----
+
+. Verify DNS resolution from inside the application pod — confirm it resolves the `postgres` Service to the database pod IP:
++
+[source,bash]
+----
+oc exec $API_POD -n {user}-database -- \
+  bash -c "getent hosts postgres"
+----
++
+[source,text]
+----
+10.128.2.15     postgres.{user}-database.svc.cluster.local postgres
+----
++
+The application pod resolves `postgres` to the database pod's IP address through the Kubernetes headless Service.
+
+. Insert a new product record from the application pod, simulating the merchandising team adding a new item via the API write path:
++
+[source,bash]
+----
+oc exec $API_POD -n {user}-database -- \
+  psql -c "INSERT INTO products (sku, name, price, stock) \
+  VALUES ('DS-005', 'Mechanical Mouse RGB', 89.99, 120);"
+----
++
+[source,text]
+----
+INSERT 0 1
+----
+
+. Verify the new product is visible from the database pod — confirming the write reached the database and both app replicas will see it on their next poll:
++
+[source,bash]
+----
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod \
+  -c "SELECT id, sku, name, price, stock FROM products ORDER BY id;"
+----
++
+[source,text]
+----
+ id |  sku   |         name          | price  | stock
+----+--------+-----------------------+--------+-------
+  1 | DS-001 | Wireless Headphones   |  79.99 |   150
+  2 | DS-002 | USB-C Hub 7-Port      |  49.99 |   300
+  3 | DS-003 | Mechanical Keyboard   | 129.99 |    75
+  4 | DS-004 | Webcam HD 1080p       |  59.99 |   200
+  5 | DS-005 | Mechanical Mouse RGB  |  89.99 |   120
+(5 rows)
+----
+
+=== Verify
+
+Confirm the second application replica also sees the new product:
+
+[source,bash]
+----
+API_POD2=$(oc get pod -l app=datastore-api -n {user}-database \
+  -o jsonpath='{.items[1].metadata.name}')
+oc exec $API_POD2 -n {user}-database -- \
+  psql -c "SELECT COUNT(*) AS total_products FROM products;"
+----
+
+[source,text]
+----
+ total_products
+----------------
+              5
+(1 row)
+----
+
+Both application replicas read from the same PostgreSQL instance and see 5 products. The write from one replica is immediately visible to all other replicas — because all state is in the database, not in the application pods. Move on to Exercise 3 to scale and update the application.
+
+[#exercise-3-scale-the-application-and-trigger-a-rolling-update]
+== Exercise 3: Scale the application and trigger a rolling update
+
+DataStore Inc's retail stores run their busiest traffic on Monday mornings. The analytics API needs to scale out to handle the load. You will scale the Deployment to 4 replicas, trigger a rolling update to deploy a new API version, and observe how the application reconnects after a database pod restart.
+
+. Scale the Deployment from 2 to 4 replicas. Because the application is stateless, this is a single command:
++
+[source,bash]
+----
+oc scale deployment datastore-api --replicas=4 -n {user}-database
+----
++
+[source,text]
+----
+deployment.apps/datastore-api scaled
+----
+
+. Watch the 2 new replicas start alongside the existing 2:
++
+[source,bash]
+----
+oc get pods -l app=datastore-api -n {user}-database
+----
++
+[source,text]
+----
+NAME                             READY   STATUS    RESTARTS   AGE
+datastore-api-7d9f8b6c4-k2p9x   1/1     Running   0          5m
+datastore-api-7d9f8b6c4-m7q3t   1/1     Running   0          5m
+datastore-api-7d9f8b6c4-r9s2w   1/1     Running   0          12s
+datastore-api-7d9f8b6c4-v4n8p   1/1     Running   0          12s
+----
++
+All 4 replicas share the same PostgreSQL connection target. No database configuration change was needed to add 2 more application pods.
+
+. Deploy API v2 by updating the script to report total inventory value alongside the product count. Update the ConfigMap:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datastore-api-scripts
+  namespace: {user}-database
+data:
+  api.sh: |
+    #!/bin/bash
+    echo "DataStore Inc Analytics API v2 starting"
+    echo "Database host : $PGHOST"
+    echo "Database name : $PGDATABASE"
+    echo "Database user : $PGUSER"
+
+    until psql -c "SELECT 1;" >/dev/null 2>&1; do
+      echo "$(date '+%H:%M:%S'): Waiting for database connection..."
+      sleep 5
+    done
+
+    echo "$(date '+%H:%M:%S'): Connected. Starting inventory poll (v2)."
+
+    while true; do
+      RESULT=$(psql -t -c \
+        "SELECT COUNT(*), COALESCE(SUM(price * stock), 0) FROM products;" \
+        2>/dev/null)
+      PSQL_EXIT=$?
+      if [ $PSQL_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
+        COUNT=$(echo "$RESULT" | cut -d'|' -f1 | tr -d ' ')
+        VALUE=$(echo "$RESULT" | cut -d'|' -f2 | tr -d ' ')
+        echo "$(date '+%H:%M:%S'): $COUNT products | total inventory value: \$$VALUE"
+        psql -c "SELECT id, sku, name, price, stock, (price * stock) AS value \
+          FROM products ORDER BY id;"
+      else
+        echo "$(date '+%H:%M:%S'): Database connection lost. Retrying on next cycle."
+      fi
+      sleep 30
+    done
+EOF
+----
++
+[source,text]
+----
+configmap/datastore-api-scripts configured
+----
++
+[NOTE]
+====
+Kubernetes does not restart pods automatically when a ConfigMap changes. You must trigger the rollout manually. This is intentional — it separates configuration updates from deployment events, giving you control over when the new configuration takes effect.
+====
+
+. Trigger a rolling update by restarting the Deployment. The `rollout restart` command increments the pod template annotation, causing all pods to be replaced one at a time:
++
+[source,bash]
+----
+oc rollout restart deployment/datastore-api -n {user}-database
+----
++
+[source,text]
+----
+deployment.apps/datastore-api restarted
+----
+
+. Watch the rolling update. With `maxUnavailable: 0`, a new pod starts and becomes ready before an old one is removed — zero downtime:
++
+[source,bash]
+----
+oc rollout status deployment/datastore-api -n {user}-database
+----
++
+[source,text]
+----
+Waiting for deployment "datastore-api" rollout to finish: 1 out of 4 new replicas have been updated...
+Waiting for deployment "datastore-api" rollout to finish: 2 out of 4 new replicas have been updated...
+Waiting for deployment "datastore-api" rollout to finish: 3 out of 4 new replicas have been updated...
+Waiting for deployment "datastore-api" rollout to finish: 4 out of 4 new replicas have been updated...
+Waiting for deployment "datastore-api" rollout to finish: 1 old replicas are pending termination...
+successfully rolled out
+----
+
+. Verify the v2 logs show the new inventory value calculation:
++
+[source,bash]
+----
+oc logs -l app=datastore-api -n {user}-database --prefix --tail=5
+----
++
+[source,text]
+----
+[pod/datastore-api-9c4d7e2f1-a3b5k/api] DataStore Inc Analytics API v2 starting
+[pod/datastore-api-9c4d7e2f1-a3b5k/api] 10:55:00: Connected. Starting inventory poll (v2).
+[pod/datastore-api-9c4d7e2f1-a3b5k/api] 10:55:00: 5 products | total inventory value: $59541.55
+----
+
+. Now simulate a database pod crash and observe how the application handles reconnection. Delete the database pod:
++
+[source,bash]
+----
+oc delete pod postgres-0 -n {user}-database
+----
++
+[source,text]
+----
+pod "postgres-0" deleted
+----
+
+. Watch the API logs during the database restart. The application will log connection failures during the brief outage and resume automatically when the database pod comes back:
++
+[source,bash]
+----
+oc logs -l app=datastore-api -n {user}-database --prefix --tail=10 -f
+----
++
+[source,text]
+----
+[pod/datastore-api-9c4d7e2f1-a3b5k/api] 10:56:30: Database connection lost. Retrying on next cycle.
+[pod/datastore-api-9c4d7e2f1-a3b5k/api] 10:57:00: Database connection lost. Retrying on next cycle.
+[pod/datastore-api-9c4d7e2f1-a3b5k/api] 10:57:30: 5 products | total inventory value: $59541.55
+----
++
+Press `Ctrl+C` after you see the successful poll resume.
+
+. View the rollout history to confirm both versions are tracked:
++
+[source,bash]
+----
+oc rollout history deployment/datastore-api -n {user}-database
+----
++
+[source,text]
+----
+REVISION  CHANGE-CAUSE
+1         <none>
+2         <none>
+----
+
+. [Optional] To practice rollback, run the following command to revert to v1. The application will resume polling without the inventory value column. Skip this step to keep v2 running — the Verify section below confirms the v2 state:
++
+[source,bash]
+----
+oc rollout undo deployment/datastore-api -n {user}-database
+----
++
+[source,text]
+----
+deployment.apps/datastore-api rolled back
+----
++
+[NOTE]
+====
+`oc rollout undo` rolls back to the previous ReplicaSet's pod template. It does not revert the ConfigMap. To fully revert a ConfigMap-driven update, you must also restore the previous ConfigMap version.
+====
+
+=== Verify
+
+Confirm the final state: 4 application replicas running alongside the healthy database pod, all reading from the same 5 products:
+
+[source,bash]
+----
+oc get deployment,pod -n {user}-database
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod -c "SELECT COUNT(*) FROM products;"
+----
+
+[source,text]
+----
+NAME                            READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/datastore-api   4/4     4            4           15m
+
+NAME                                 READY   STATUS    RESTARTS   AGE
+pod/datastore-api-9c4d7e2f1-a3b5k   1/1     Running   0          2m
+pod/datastore-api-9c4d7e2f1-b7c2p   1/1     Running   0          2m
+pod/datastore-api-9c4d7e2f1-d9f4r   1/1     Running   0          2m
+pod/datastore-api-9c4d7e2f1-e1g6s   1/1     Running   0          2m
+pod/postgres-0                       1/1     Running   0          4m
+
+ count
+-------
+     5
+(1 row)
+----
+
+[#exercise-4-cache-inventory-data-with-red-hat-data-grid]
+== Exercise 4: Cache inventory data with Red Hat Data Grid
+
+DataStore Inc's analytics dashboard polls inventory totals every few seconds across 20 or more application pods. That volume of direct PostgreSQL queries causes measurable load. Red Hat Data Grid provides an in-memory cache layer between the application and the database. The API checks the cache first and queries PostgreSQL only on a cache miss, then writes the result back to the cache with a time-to-live. This is the cache-aside pattern.
+
+=== Learning objectives
+
+* Verify that the Red Hat Data Grid operator is installed and ready
+* Deploy a single-replica Data Grid instance using the `Infinispan` custom resource
+* Configure the analytics API to use the cache-aside pattern
+* Observe cache hits and misses in the application logs
+* Confirm the cached value via the Data Grid REST API
+
+=== Step 1: Verify the Data Grid operator
+
+Confirm the Data Grid operator CSV is in `Succeeded` state:
+
+[source,bash]
+----
+oc get csv -n openshift-operators | grep datagrid
+----
+
+[source,text]
+----
+datagrid-operator.v8.5.x   Data Grid   8.5.x   ...   Succeeded
+----
+
+=== Step 2: Create the operator credentials Secret
+
+The Data Grid operator requires credentials in `identities.yaml` format. Apply the Secret:
+
+[source,bash]
+----
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: datastore-cache-credentials
+  namespace: {user}-database
+stringData:
+  identities.yaml: |
+    credentials:
+    - username: datastore
+      password: DataStore2024Cache!
+      roles:
+      - admin
+EOF
+----
+
+[source,text]
+----
+secret/datastore-cache-credentials created
+----
+
+=== Step 3: Create the application credentials Secret
+
+Create a second Secret with simple key-value pairs for injection into the Deployment:
+
+[source,bash]
+----
+oc create secret generic datastore-cache-app \
+  --from-literal=DG_USER=datastore \
+  --from-literal=DG_PASSWORD=DataStore2024Cache! \
+  -n {user}-database
+----
+
+[source,text]
+----
+secret/datastore-cache-app created
+----
+
+=== Step 4: Deploy the Infinispan custom resource
+
+Apply a single-replica Data Grid instance:
+
+[source,bash]
+----
+cat <<EOF | oc apply -f -
+apiVersion: infinispan.org/v1
+kind: Infinispan
+metadata:
+  name: datastore-cache
+  namespace: {user}-database
+spec:
+  replicas: 1
+  security:
+    endpointSecretName: datastore-cache-credentials
+  service:
+    type: DataGrid
+EOF
+----
+
+[source,text]
+----
+infinispan.infinispan.org/datastore-cache created
+----
+
+=== Step 5: Wait for Data Grid to reach Running phase
+
+Watch the Infinispan resource until the `Phase` column shows `Running`:
+
+[source,bash]
+----
+oc get infinispan datastore-cache -n {user}-database -w
+----
+
+[source,text]
+----
+NAME              AGE   REPLICAS   READY   PHASE
+datastore-cache   10s   1          0       Starting
+datastore-cache   45s   1          1       Running
+----
+
+Press `Ctrl+C` to stop watching once you see `Running`. The operator creates a Service named `datastore-cache` on port `11222`.
+
+=== Step 6: Add Data Grid environment variables to the API Deployment
+
+Inject the Data Grid hostname and credentials into the existing `datastore-api` Deployment:
+
+[source,bash]
+----
+oc set env deployment/datastore-api \
+  DG_HOST=datastore-cache \
+  --from=secret/datastore-cache-app \
+  -n {user}-database
+----
+
+[source,text]
+----
+deployment.apps/datastore-api updated
+----
+
+=== Step 7: Update the api.sh script to use the cache-aside pattern
+
+Replace the ConfigMap with an updated `api.sh` that checks the cache on every poll:
+
+[source,bash]
+----
+cat <<'SCRIPT' > /tmp/api-v3.sh
+#!/bin/bash
+set -euo pipefail
+
+export PGPASSWORD="$POSTGRESQL_PASSWORD"
+DG_BASE="https://${DG_HOST}:11222"
+
+# Create the inventory cache on startup (409 if it already exists is acceptable)
+curl -sk -u "$DG_USER:$DG_PASSWORD" -X POST \
+  "$DG_BASE/rest/v2/caches/inventory" \
+  -H "Content-Type: application/json" \
+  -d '{"distributed-cache":{"mode":"SYNC"}}' >/dev/null 2>&1
+
+while true; do
+  HTTP_CODE=$(curl -sk -u "$DG_USER:$DG_PASSWORD" \
+    -o /tmp/cache_val -w "%{http_code}" \
+    "$DG_BASE/rest/v2/caches/inventory/total")
+  CACHED_VAL=$(cat /tmp/cache_val)
+
+  if [ "$HTTP_CODE" = "200" ] && [ -n "$CACHED_VAL" ]; then
+    echo "$(date '+%H:%M:%S'): [CACHE HIT] $CACHED_VAL"
+  else
+    RESULT=$(psql -h "$POSTGRESQL_SERVICE_HOST" \
+      -U "$POSTGRESQL_USER" \
+      -d "$POSTGRESQL_DATABASE" \
+      -t -c "SELECT COUNT(*), COALESCE(SUM(price * stock), 0) FROM products;" 2>/dev/null)
+    PSQL_EXIT=$?
+    if [ $PSQL_EXIT -eq 0 ] && [ -n "$RESULT" ]; then
+      COUNT=$(echo "$RESULT" | cut -d'|' -f1 | tr -d ' ')
+      VALUE=$(echo "$RESULT" | cut -d'|' -f2 | tr -d ' ')
+      SUMMARY="${COUNT} products, \$${VALUE}"
+      curl -sk -u "$DG_USER:$DG_PASSWORD" -X PUT \
+        -H "Content-Type: text/plain" \
+        -H "timeToLiveSeconds: 60" \
+        "$DG_BASE/rest/v2/caches/inventory/total" \
+        -d "$SUMMARY" >/dev/null 2>&1
+      echo "$(date '+%H:%M:%S'): [CACHE MISS] $SUMMARY (cached for 60s)"
+    else
+      echo "$(date '+%H:%M:%S'): Database connection lost. Retrying."
+    fi
+  fi
+  sleep 15
+done
+SCRIPT
+
+oc create configmap datastore-api-scripts \
+  --from-file=api.sh=/tmp/api-v3.sh \
+  --dry-run=client -o yaml | oc apply -f - -n {user}-database
+----
+
+[source,text]
+----
+configmap/datastore-api-scripts configured
+----
+
+=== Step 8: Trigger a rolling update
+
+Restart the Deployment so pods pick up the new ConfigMap content and environment variables:
+
+[source,bash]
+----
+oc rollout restart deployment/datastore-api -n {user}-database
+oc rollout status deployment/datastore-api -n {user}-database
+----
+
+[source,text]
+----
+Waiting for deployment "datastore-api" rollout to finish: 0 out of 4 new replicas have been updated...
+deployment "datastore-api" successfully rolled out
+----
+
+=== Step 9: Observe cache hits and misses in the logs
+
+Tail the logs from one API pod. The first poll after startup is always a cache miss because the cache entry does not yet exist. All subsequent polls within the 60-second TTL are cache hits:
+
+[source,bash]
+----
+API_POD=$(oc get pods -l app=datastore-api -n {user}-database \
+  -o jsonpath='{.items[0].metadata.name}')
+oc logs -f $API_POD -n {user}-database
+----
+
+[source,text]
+----
+14:02:01: [CACHE MISS] 5 products, $59541.55 (cached for 60s)
+14:02:16: [CACHE HIT] 5 products, $59541.55
+14:02:31: [CACHE HIT] 5 products, $59541.55
+14:02:46: [CACHE HIT] 5 products, $59541.55
+14:03:01: [CACHE MISS] 5 products, $59541.55 (cached for 60s)
+----
+
+Press `Ctrl+C` to stop following the logs.
+
+=== Verify
+
+Confirm the cached value directly via the Data Grid REST API from inside an API pod:
+
+[source,bash]
+----
+API_POD=$(oc get pods -l app=datastore-api -n {user}-database \
+  -o jsonpath='{.items[0].metadata.name}')
+oc exec $API_POD -n {user}-database -- \
+  curl -sk -u datastore:DataStore2024Cache! \
+  https://datastore-cache:11222/rest/v2/caches/inventory/total
+----
+
+[source,text]
+----
+5 products, $59541.55
+----
+
+NOTE: The cache TTL is 60 seconds. After expiry, the next poll from any API pod is a cache miss and the value is refreshed from PostgreSQL. This is the cache-aside pattern: the application manages what goes into the cache, when it is written, and when it expires. Data Grid does not query the database directly.
+
+== Troubleshooting
+
+*Issue*: Application pods start but log `Waiting for database connection...` indefinitely
+
+*Solution*:
+
+. Verify the Service resolves correctly from inside an API pod:
++
+[source,bash]
+----
+oc exec -it $(oc get pod -l app=datastore-api -n {user}-database \
+  -o jsonpath='{.items[0].metadata.name}') -n {user}-database -- \
+  bash -c "getent hosts postgres"
+----
+. If DNS resolution fails, confirm the `postgres` Service exists in the same namespace:
++
+[source,bash]
+----
+oc get service postgres -n {user}-database
+----
+. If the Service exists but the pod cannot connect, check whether the PostgreSQL pod is ready:
++
+[source,bash]
+----
+oc get pod postgres-0 -n {user}-database
+----
+
+*Issue*: Application pods fail to start — `Error: failed to create containerd task`
+
+*Solution*:
+
+. Check whether the `datastore-api-scripts` ConfigMap exists and has the `api.sh` key:
++
+[source,bash]
+----
+oc get configmap datastore-api-scripts -n {user}-database -o jsonpath='{.data.api\.sh}' | head -5
+----
+. If the ConfigMap is missing or empty, recreate it from the step in Exercise 1.
+
+*Issue*: `oc rollout undo` reverts the pod template but the v1 script does not appear
+
+*Solution*:
+
+. `oc rollout undo` reverts the pod template (including the `kubectl.kubernetes.io/last-applied-configuration` annotation) but does not touch ConfigMaps. Manually reapply the v1 ConfigMap from Exercise 1 to restore the original script.
+
+*Issue*: `INSERT INTO products` fails with `ERROR: permission denied`
+
+*Solution*:
+
+. The `datastore_app` user was created with full rights to the `datastore_prod` database but may not have INSERT rights if the table was created by a different superuser. Grant rights explicitly:
++
+[source,bash]
+----
+oc exec postgres-0 -n {user}-database -- \
+  psql -U postgres -d datastore_prod \
+  -c "GRANT INSERT, SELECT, UPDATE ON products TO datastore_app;"
+----
+
+== Module summary
+
+DataStore Inc's full stack is now running on OpenShift: a stateless analytics API Deployment connected to the stateful PostgreSQL StatefulSet, both in the same namespace, with credentials injected from a shared Secret.
+
+The work across all 5 modules illustrates the two tiers of disaster recovery. The analytics API has trivially simple DR: redeploy the Deployment manifests on any cluster and point traffic at it. The PostgreSQL database requires explicit DR planning. The VolumeSnapshot taken in Module 3 defines a concrete Recovery Point Objective (RPO) for DataStore Inc: any data written after that snapshot would be lost in a full-cluster failure. The restore performed in Module 4 demonstrated the Recovery Time Objective (RTO): the time from issuing the restore command to a verified, running database. For lower RPO, ODF Regional-DR replicates PVCs to a second cluster asynchronously on a configurable schedule. For zero RPO, ODF Metro-DR uses synchronous replication between datacenters close enough to support it.
+
+*What you accomplished:*
+
+* Deployed a stateless analytics API Deployment with 2 replicas that connects to PostgreSQL using the `postgres` Service DNS name and credentials from the existing `postgres-credentials` Secret
+* Verified DNS resolution and database connectivity from both application replicas, and confirmed the read and write paths work end to end
+* Scaled the Deployment to 4 replicas with a single command — no database configuration change required
+* Deployed API v2 with a rolling update using `maxUnavailable: 0` for zero-downtime deployment, and observed the application automatically reconnect after a database pod restart
+* Rolled back to v1 using `oc rollout undo` and confirmed rollout history tracking
+
+*Key takeaways:*
+
+* Stateless applications can scale freely because any pod can handle any request — they hold no per-pod state. Stateful applications cannot scale the same way because data and identity are tied to a specific pod. This distinction drives the choice between `Deployment` and `StatefulSet`
+* Disaster recovery complexity follows the stateless/stateful boundary. Recovering a stateless tier is traffic redirection — point the load balancer at a second cluster and the application is running in seconds. Recovering a stateful tier requires storage recovery: either restoring from a VolumeSnapshot (backup/restore, RPO = age of last snapshot) or failing over replicated PVCs (ODF Regional-DR for async replication, ODF Metro-DR for synchronous zero-RPO replication between nearby datacenters)
+* Storage is the primary challenge when containerizing stateful workloads. Block storage (gp3-csi) is single-AZ — the database pod is zone-affined to the node where the PVC lives. OpenShift Data Foundation (ODF) removes this constraint with 3-way synchronous replication across availability zones
+* The short DNS form `postgres` resolves to the Service in the same namespace — use the fully qualified name `postgres.{user}-database.svc.cluster.local` when connecting from a different namespace
+* ConfigMap changes do not restart pods automatically — always trigger a `rollout restart` or patch the pod template to deploy a configuration change
+* `maxUnavailable: 0` combined with `maxSurge: 1` guarantees zero-downtime rolling updates: a new pod is fully ready before any old pod is removed. This is the correct setting for database-connected applications where reconnection during startup has a cost
+* Application-level reconnection logic is required for production. The poll loop in this module demonstrates the pattern. For production workloads, use a connection pool such as pgBouncer in front of PostgreSQL: it maintains a warm pool of server connections, absorbs client reconnections transparently during database restarts, and reduces the per-connection overhead that accumulates when many application replicas connect directly to PostgreSQL
+
+*Next steps:*
+
+The conclusion summarizes all 5 modules and provides references for production hardening topics including connection pooling with pgBouncer, the Crunchy PostgreSQL Operator for automated HA, and monitoring with the postgres_exporter sidecar.

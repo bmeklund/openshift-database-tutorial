@@ -1,0 +1,547 @@
+= Module 1: Databases on OpenShift vs. VMs
+
+include::partial$_attributes.adoc[]
+
+DataStore Inc has run PostgreSQL on virtual machines for over a decade. The VMs are reliable but slow to provision, expensive to maintain, and require manual failover. Your CTO has asked you to evaluate OpenShift as the new home for PostgreSQL, but before you deploy anything, you need to understand how containerized databases differ from VM-based ones — and what that means for latency, consistency, and operations.
+
+In this module, you will explore the OpenShift environment, examine how OpenShift manages persistent storage, and compare VM-based and containerized PostgreSQL to build the foundation for your migration plan.
+
+== Learning objectives
+
+By the end of this module, you will be able to:
+
+* Explore the OpenShift storage landscape and identify StorageClasses suitable for database workloads
+* Describe the key differences between VM-based and containerized PostgreSQL, including latency, I/O consistency, and operational trade-offs
+* Identify the 4 core OpenShift primitives — StatefulSet, Service, Secret, and PodDisruptionBudget — that make databases production-ready on OpenShift
+* Determine when running a database on OpenShift is the right architectural choice
+
+[#exercise-1-explore-your-environment]
+== Exercise 1: Explore your environment
+
+DataStore Inc's OpenShift cluster is already provisioned. Before committing to a migration plan, you need to understand what storage resources are available — the most critical concern for any database workload.
+
+. Log in to OpenShift using the CLI:
++
+[source,bash]
+----
+oc login {console_url} --username={user} --password={password}
+----
++
+[source,text]
+----
+Login successful.
+
+You have access to the following projects and can switch between them with 'oc project <projectname>':
+
+  * {user}-database
+
+Using project "{user}-database".
+----
+
+. Confirm you are in the correct namespace:
++
+[source,bash]
+----
+oc project {user}-database
+----
++
+[source,text]
+----
+Now using project "{user}-database" on server "https://api.cluster.example.com:6443".
+----
+
+. List the available StorageClasses on the cluster:
++
+[source,bash]
+----
+oc get storageclass
+----
++
+[source,text]
+----
+NAME                  PROVISIONER       RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION
+gp3-csi (default)     ebs.csi.aws.com   Delete          WaitForFirstConsumer   true
+gp3-csi-retain        ebs.csi.aws.com   Retain          WaitForFirstConsumer   true
+----
++
+[NOTE]
+====
+Your cluster may show different StorageClass names depending on the infrastructure provider (AWS, Azure, GCP, or on-prem ODF). For database workloads, always use a StorageClass with `ALLOWVOLUMEEXPANSION: true` so you can grow PVCs online. Prefer `RECLAIMPOLICY: Retain` to prevent accidental data deletion when a PVC is removed.
+====
+
+. Inspect the default StorageClass to understand its characteristics:
++
+[source,bash]
+----
+oc describe storageclass gp3-csi
+----
++
+[source,text]
+----
+Name:                  gp3-csi
+IsDefaultClass:        Yes
+Provisioner:           ebs.csi.aws.com
+Parameters:            encrypted=true,type=gp3
+AllowVolumeExpansion:  True
+ReclaimPolicy:         Delete
+VolumeBindingMode:     WaitForFirstConsumer
+----
+
+. Check whether a PostgreSQL operator is installed on the cluster:
++
+[source,bash]
+----
+oc get csv -n openshift-operators | grep -i postgres
+----
++
+[source,text]
+----
+NAME                        DISPLAY                              VERSION   PHASE
+crunchy-postgres-operator   Crunchy Postgres for Kubernetes      5.5.0     Succeeded
+----
+
+=== Verify
+
+Confirm you have the required permissions to create database resources:
+
+[source,bash]
+----
+oc auth can-i create persistentvolumeclaims
+oc auth can-i create statefulsets
+----
+
+[source,text]
+----
+yes
+yes
+----
+
+You have the permissions needed for a PostgreSQL deployment. Move on to Exercise 2.
+
+[#exercise-2-vms-vs-containers-understanding-the-trade-offs]
+== Exercise 2: VMs vs. containers — understanding the trade-offs
+
+DataStore Inc's current PostgreSQL VM setup uses dedicated resources: 16 GB RAM, 8 vCPUs, and a 500 GB SSD, reserved exclusively for 1 database instance. You need to understand exactly what changes when that database moves to OpenShift, and where the trade-offs lie.
+
+. Document the VM baseline configuration for reference. Create a ConfigMap that captures the current VM profile:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vm-baseline-spec
+  namespace: {user}-database
+data:
+  spec.txt: |
+    DataStore Inc - VM-based PostgreSQL baseline
+    =============================================
+    Provisioning time : 2-3 weeks (VM request, storage, OS, PostgreSQL install, tuning)
+
+    Resource allocation (dedicated, always reserved):
+      CPU     : 8 vCPUs   (dedicated, no sharing — idle 60% of the time)
+      Memory  : 16 GB RAM (dedicated, no sharing)
+      Storage : 500 GB SSD (dedicated LUN, fixed size)
+
+    High availability:
+      Standby VM configured manually
+      Cron-monitored replication
+      Manual failover: 15-30 min RTO, DBA on-call required
+
+    Backups:
+      pg_dump via cron
+      rsync to NFS share
+      No coordination with storage snapshots
+EOF
+----
++
+[source,text]
+----
+configmap/vm-baseline-spec created
+----
+
+. Create a ConfigMap showing the equivalent OpenShift approach:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-approach-spec
+  namespace: {user}-database
+data:
+  spec.txt: |
+    DataStore Inc - OpenShift-based PostgreSQL approach
+    ====================================================
+    Provisioning time : < 5 minutes (apply YAML, operator provisions everything)
+
+    Resource allocation (requests + limits, bin-packed across nodes):
+      CPU requests    : 500m  (burst to 2000m — unused cycles shared with other workloads)
+      Memory requests : 1 Gi  (burst to 4 Gi — 60% utilization gap eliminated)
+      Storage         : 10 Gi PVC from StorageClass (thin-provisioned, expandable online)
+
+    High availability:
+      StatefulSet replicas + PodDisruptionBudget (automated)
+      Operator-managed failover: < 30 second RTO
+      No manual intervention required
+
+    Backups:
+      VolumeSnapshots (storage-level, crash-consistent)
+      pgBackRest (application-consistent, incremental)
+      Scheduled automatically by the operator
+EOF
+----
++
+[source,text]
+----
+configmap/openshift-approach-spec created
+----
+
+. Display both configurations side by side:
++
+[source,bash]
+----
+echo "=== VM BASELINE ===" && oc get configmap vm-baseline-spec -o jsonpath='{.data.spec\.txt}'
+echo ""
+echo "=== OPENSHIFT APPROACH ===" && oc get configmap openshift-approach-spec -o jsonpath='{.data.spec\.txt}'
+----
+
+. Now create a ConfigMap documenting the latency, consistency, and decision criteria — the 3 areas DataStore Inc's leadership asked you to evaluate:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: migration-evaluation
+  namespace: {user}-database
+data:
+  latency.txt: |
+    LATENCY CONSIDERATIONS
+    ======================
+    VM-based:
+    - Direct hardware access for most storage configurations
+    - Network latency predictable on dedicated storage VLANs
+    - Typical SSD write latency: 0.1-0.5 ms
+
+    OpenShift (container with CSI block storage):
+    - CSI driver adds a thin layer between pod and storage (gp3, ODF RBD, etc.)
+    - Typical overhead vs bare metal: 2-5% for block storage
+    - PostgreSQL WAL writes are the critical path — sync I/O latency matters most
+    - Mitigation: use local NVMe StorageClass for latency-sensitive workloads
+
+    Verdict for DataStore Inc:
+    - Retail analytics (OLAP queries) : OpenShift overhead acceptable (<5% on reads)
+    - High-frequency OLTP (<1ms P99) : evaluate local NVMe StorageClass first
+
+  consistency.txt: |
+    CONSISTENCY CONSIDERATIONS
+    ==========================
+    VM-based:
+    - No container restart risk during transactions (OS-level stability)
+    - Network partitions are rare in dedicated VM storage networks
+
+    OpenShift (container):
+    - Pod evictions can interrupt long-running transactions
+    - Mitigation: set terminationGracePeriodSeconds >= 60 to allow PostgreSQL
+      to write its checkpoint cleanly before the pod is killed
+    - Multi-replica setups need Patroni or an operator for consistent primary election
+    - ReadWriteOnce PVCs prevent split-brain: only 1 pod writes at a time
+
+    Verdict for DataStore Inc:
+    - Standard transactional workloads: OpenShift is safe with proper configuration
+    - Critical recommendation: always set terminationGracePeriodSeconds: 60
+
+  decision.txt: |
+    WHEN OPENSHIFT IS THE RIGHT CHOICE
+    ====================================
+    - Workloads where 2-5% I/O overhead is acceptable
+    - Teams that need developer self-service database provisioning
+    - Applications requiring consistent environments across dev/staging/prod
+    - Workloads where HA automation matters more than raw single-node throughput
+    - Organizations migrating from VMs to reduce infrastructure cost and provisioning time
+
+    WHEN TO CONSIDER ALTERNATIVES
+    ==============================
+    - Workloads requiring < 1 ms P99 storage I/O with no tolerance for overhead
+    - Databases > 10 TB with specialized hardware requirements
+    - Legacy databases with kernel module dependencies incompatible with containers
+EOF
+----
++
+[source,text]
+----
+configmap/migration-evaluation created
+----
+
+. Review the evaluation:
++
+[source,bash]
+----
+echo "--- LATENCY ---"
+oc get configmap migration-evaluation -o jsonpath='{.data.latency\.txt}'
+echo ""
+echo "--- CONSISTENCY ---"
+oc get configmap migration-evaluation -o jsonpath='{.data.consistency\.txt}'
+echo ""
+echo "--- DECISION CRITERIA ---"
+oc get configmap migration-evaluation -o jsonpath='{.data.decision\.txt}'
+----
+
+=== Verify
+
+Confirm all 3 evaluation ConfigMaps are in your namespace:
+
+[source,bash]
+----
+oc get configmap -n {user}-database
+----
+
+[source,text]
+----
+NAME                     DATA   AGE
+migration-evaluation     3      1m
+openshift-approach-spec  1      2m
+vm-baseline-spec         1      3m
+----
+
+DataStore Inc's migration evaluation is documented. Move on to Exercise 3.
+
+[#exercise-3-the-4-openshift-primitives-for-database-workloads]
+== Exercise 3: The 4 OpenShift primitives for database workloads
+
+Before deploying PostgreSQL in Module 2, you need to understand the 4 core Kubernetes objects that make stateful databases production-ready on OpenShift. In this exercise, you will review example definitions for each one.
+
+. Create a reference ConfigMap containing annotated examples of all 4 primitives:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-primitives-reference
+  namespace: {user}-database
+data:
+  1-statefulset.yaml: |
+    # StatefulSet: provides stable network identity and ordered pod management.
+    # Unlike Deployments, StatefulSets guarantee pod ordering (pod-0 before pod-1)
+    # and each pod gets its own PVC from volumeClaimTemplates.
+    # terminationGracePeriodSeconds: 60 gives PostgreSQL time to checkpoint.
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata:
+      name: postgres
+    spec:
+      serviceName: postgres
+      replicas: 1
+      selector:
+        matchLabels:
+          app: postgres
+      template:
+        spec:
+          terminationGracePeriodSeconds: 60
+          containers:
+          - name: postgres
+            image: registry.redhat.io/rhel9/postgresql-{postgresql_version}:latest
+            resources:
+              requests:
+                cpu: 500m
+                memory: 1Gi
+              limits:
+                cpu: 2000m
+                memory: 4Gi
+            volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgsql/data
+      volumeClaimTemplates:
+      - metadata:
+          name: data
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: gp3-csi-retain
+          resources:
+            requests:
+              storage: 10Gi
+
+  2-service.yaml: |
+    # Service (headless): stable DNS name for each pod.
+    # postgres-0.postgres.{namespace}.svc.cluster.local
+    # Used internally for pod-to-pod replication in HA setups.
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: postgres
+    spec:
+      clusterIP: None
+      selector:
+        app: postgres
+      ports:
+      - port: 5432
+        name: postgres
+
+  3-secret.yaml: |
+    # Secret: stores database credentials.
+    # Never hardcode passwords in YAML or ConfigMaps.
+    # OpenShift injects Secrets as environment variables or volume files.
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: postgres-credentials
+    type: Opaque
+    stringData:
+      POSTGRESQL_USER: datastore_app
+      POSTGRESQL_PASSWORD: changeme-use-a-generated-password
+      POSTGRESQL_DATABASE: datastore_prod
+
+  4-pdb.yaml: |
+    # PodDisruptionBudget: prevents OpenShift from evicting too many DB pods at once
+    # during node maintenance, upgrades, or drains.
+    # minAvailable: 1 means at least 1 replica must stay running.
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata:
+      name: postgres-pdb
+    spec:
+      minAvailable: 1
+      selector:
+        matchLabels:
+          app: postgres
+EOF
+----
++
+[source,text]
+----
+configmap/postgres-primitives-reference created
+----
+
+. List all 4 primitive definitions stored in the ConfigMap:
++
+[source,bash]
+----
+oc get configmap postgres-primitives-reference \
+  -o jsonpath='{range $k,$v := .data}{$k}{"\n"}{end}'
+----
++
+[source,text]
+----
+1-statefulset.yaml
+2-service.yaml
+3-secret.yaml
+4-pdb.yaml
+----
+
+. Check the node topology to understand where database pods will be scheduled:
++
+[source,bash]
+----
+oc get nodes -o wide
+----
++
+[source,text]
+----
+NAME                                       STATUS   ROLES           AGE   VERSION
+ip-10-0-1-100.us-east-1.compute.internal  Ready    control-plane   30d   v1.33.x
+ip-10-0-1-200.us-east-1.compute.internal  Ready    worker          30d   v1.33.x
+ip-10-0-1-201.us-east-1.compute.internal  Ready    worker          30d   v1.33.x
+ip-10-0-1-202.us-east-1.compute.internal  Ready    worker          30d   v1.33.x
+----
++
+[NOTE]
+====
+HA database deployments require at least 2 worker nodes so anti-affinity rules can spread replicas across physical machines. DataStore Inc's 3-worker cluster meets this requirement. For production workloads, use `podAntiAffinity` rules in the StatefulSet to prevent 2 PostgreSQL pods from landing on the same node.
+====
+
+. Clean up the reference ConfigMaps (they were for learning — Module 2 creates the real deployment):
++
+[source,bash]
+----
+oc delete configmap vm-baseline-spec openshift-approach-spec migration-evaluation postgres-primitives-reference
+----
++
+[source,text]
+----
+configmap "vm-baseline-spec" deleted
+configmap "openshift-approach-spec" deleted
+configmap "migration-evaluation" deleted
+configmap "postgres-primitives-reference" deleted
+----
+
+=== Verify
+
+Confirm the namespace is clean and ready for Module 2:
+
+[source,bash]
+----
+oc get all -n {user}-database
+----
+
+[source,text]
+----
+No resources found in {user}-database namespace.
+----
+
+Your namespace is ready for the real PostgreSQL deployment in Module 2.
+
+== Troubleshooting
+
+*Issue*: `oc login` fails with `x509: certificate signed by unknown authority`
+
+*Solution*:
+
+. Add `--insecure-skip-tls-verify` to the login command for the lab environment:
++
+[WARNING]
+====
+`--insecure-skip-tls-verify` disables TLS certificate validation. This is only appropriate in lab environments with self-signed certificates. Never use this flag against production clusters.
+====
++
+[source,bash]
+----
+oc login {console_url} --username={user} --password={password} --insecure-skip-tls-verify
+----
+
+*Issue*: `oc get storageclass` returns no resources
+
+*Solution*:
+
+. StorageClasses are cluster-scoped — do not add `-n {user}-database`. Run `oc get storageclass` without a namespace flag.
+
+*Issue*: `oc get csv` returns no postgres results
+
+*Solution*:
+
+. Search across all namespaces: `oc get csv -A | grep -i postgres`
+. The Crunchy PostgreSQL operator may be installed cluster-wide in `openshift-operators`.
+
+*Issue*: ConfigMap not found during cleanup
+
+*Solution*:
+
+. Run `oc get configmap` to list what exists, then delete only the ConfigMaps that are present. This error is expected if a step failed or was skipped.
+
+== Module summary
+
+You have completed DataStore Inc's pre-migration evaluation and built the foundation for everything that follows.
+
+*What you accomplished:*
+
+* Explored the OpenShift storage landscape and confirmed StorageClasses are available for database workloads
+* Documented the architectural differences between VM-based and containerized PostgreSQL, including latency (2-5% CSI overhead) and consistency (terminationGracePeriodSeconds: 60 requirement)
+* Reviewed the 4 core OpenShift primitives — StatefulSet, Service, Secret, and PodDisruptionBudget — that make PostgreSQL production-ready
+* Confirmed that DataStore Inc's cluster has the worker node count and permissions needed for a successful migration
+
+*Key takeaways:*
+
+* PersistentVolumeClaims give containers durable storage that survives pod restarts — data is never lost on pod failure alone
+* Use a StorageClass with `RECLAIMPOLICY: Retain` for databases to prevent accidental PVC deletion from destroying data
+* StatefulSets are required for databases: they provide stable network identity, ordered startup, and per-pod PVCs that Deployments cannot
+* Container I/O overhead is typically 2-5% — acceptable for most workloads in exchange for automated HA and self-service provisioning
+* Always set `terminationGracePeriodSeconds: 60` — it gives PostgreSQL time to write its checkpoint cleanly before the pod is killed
+
+*Next steps:*
+
+Module 2 moves from theory to practice. You will deploy a real PostgreSQL {postgresql_version} instance, configure persistent storage, create a headless Service, and connect a client to verify the database is accepting queries.

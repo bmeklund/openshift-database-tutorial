@@ -1,0 +1,118 @@
+= Workshop details
+
+include::partial$_attributes.adoc[]
+
+== Timing and schedule
+
+=== Full workshop (3.5 hours)
+
+* *Module 1*: Databases on OpenShift vs. VMs (20 minutes)
+* *Module 2*: Deploy and connect PostgreSQL (55 minutes)
+* *Module 3*: Configuration and best practices (25 minutes)
+* *Module 4*: High availability (20 minutes)
+* *Module 5*: Connecting applications to databases (50 minutes)
+* *Break time*: 20 minutes total (suggested between modules)
+
+=== Abbreviated workshop (1 hour)
+
+* *Module 1*: Databases on OpenShift vs. VMs (15 minutes)
+* *Module 2*: Deploy and connect PostgreSQL, Exercises 1 and 2 only (30 minutes)
+* *Module 3*: Configuration, Exercise 1 only (15 minutes)
+
+== Technical requirements
+
+=== Software versions
+
+* Red Hat OpenShift {ocp_version}
+* PostgreSQL {postgresql_version}
+* OpenShift CLI (`oc`) {ocp_version}
+* Web browser (Chrome, Firefox, Safari, or Edge)
+
+=== Environment access
+
+You will have access to:
+
+* Red Hat OpenShift {ocp_version} cluster (multinode, pre-configured)
+* Terminal via the Showroom interface (no local tools required)
+* Your own namespace: `{user}-database`
+* htpasswd credentials: username `{user}`, password `{password}`
+
+=== Network access
+
+The lab environment has outbound access to:
+
+* Red Hat container registry (`registry.redhat.io`) for PostgreSQL {postgresql_version} images
+* OpenShift internal registry for workshop images
+
+== Environment setup
+
+=== Pre-workshop checklist
+
+Before starting the modules, verify your environment:
+
+[%interactive]
+* [ ] *OpenShift console access confirmed* — log in at {console_url}
+* [ ] *Terminal access working* — click the Terminal tab in the side panel
+* [ ] *`oc` CLI available* — run `oc version` in the terminal
+* [ ] *Namespace accessible* — run `oc project {user}-database`
+
+=== Setup validation
+
+Run these commands to confirm your environment is ready:
+
+[source,bash]
+----
+# Verify CLI version
+oc version
+
+# Confirm your username
+oc whoami
+
+# Confirm your namespace exists
+oc project {user}-database
+----
+
+[source,text]
+----
+Client Version: {ocp_version}
+Kube Version: v1.33.x
+Server Version: {ocp_version}
+
+{user}
+
+Now using project "{user}-database" on server "https://api.cluster.example.com:6443".
+----
+
+== Troubleshooting common setup issues
+
+*Problem*: `oc: command not found`
+→ *Solution*: The `oc` CLI is pre-installed in the terminal environment. If you see this error, refresh the browser and open a new terminal session.
+
+*Problem*: `Error from server (Forbidden): namespaces "{user}-database" is forbidden`
+→ *Solution*: Your namespace may not have been pre-created. Run `oc new-project {user}-database` to create it manually.
+
+*Problem*: `Login failed (401 Unauthorized)`
+→ *Solution*: Verify your credentials: username `{user}` and password `{password}` from the lab interface side panel.
+
+*Problem*: `ImagePullBackOff` when deploying PostgreSQL
+→ *Solution*: Run `oc describe pod <pod-name>` and check the Events section. The most common cause is a missing pull secret for `registry.redhat.io`. Ask your facilitator.
+
+== Additional learning paths
+
+After this workshop, explore these related topics:
+
+* *link:https://docs.redhat.com/en/documentation/openshift_container_platform/{ocp_version}/html/storage/index[OpenShift {ocp_version} storage documentation^]* — CSI drivers, StorageClasses, and VolumeSnapshots
+* *link:https://access.crunchydata.com/documentation/postgres-operator/latest/[Crunchy Data PGO documentation^]* — production-grade PostgreSQL operator for OpenShift
+* *link:https://www.postgresql.org/docs/16/index.html[PostgreSQL {postgresql_version} documentation^]* — official PostgreSQL reference
+
+=== Certification paths
+
+* link:https://www.redhat.com/en/services/training/ex280-red-hat-certified-specialist-in-openshift-administration-exam[Red Hat Certified Specialist in OpenShift Administration (EX280)^] — cluster administration, storage, and stateful workloads
+* link:https://www.redhat.com/en/services/training/ex288-red-hat-certified-specialist-in-openshift-application-development-exam[Red Hat Certified Specialist in OpenShift Application Development (EX288)^] — application deployment and configuration on OpenShift
+
+== Authors and contributors
+
+*Content*: Red Hat Technical Training Team +
+*PostgreSQL version*: {postgresql_version} +
+*OpenShift version*: {ocp_version} +
+*Workshop version*: 1.0

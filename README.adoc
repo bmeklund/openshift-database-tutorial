@@ -1,18 +1,20 @@
-= Showroom Template
+# OpenShift Database Workshop
 
-A template for creating Red Hat Showroom lab guides and demo content, built with https://antora.org[Antora].
+A hands-on workshop that teaches the basic concepts of running and maintaing databases on OpenShift
+The content is built with Antora and published as a static site using the Red Hat Demo Platform (Showroom) UI theme.
 
-* 0% cruft
-* Red Hat Demo Platform UI Bundle default
-* Dev Mode extension that displays the asciidoc attributes you have to work with
+## Overview
 
-== Documentation
+| | |
+|---|---|
+| **Audience Experience Level** | Beginner to Intermediate |
+| **Average Time to Complete** | 3 - 5 hours |
 
-Full documentation — getting started, content structure, configuration, local development, and AI-assisted content creation — is available at:
+---
 
-https://rhpds.github.io/showroom_template_nookbag/
+## Local development
 
-== Quick Start
+### Quick Start
 
 . https://github.com/rhpds/showroom_template_nookbag/generate[Create a repo from this template] (suggested naming: `showroom_<lab-name>`)
 . Clone your new repo and preview locally:
@@ -27,8 +29,10 @@ On SELinux systems, append `:z` to the volume mount.
 . Edit content in `content/modules/ROOT/pages/`
 . See the https://rhpds.github.io/showroom_template_nookbag/modules/content-repo.html[Content Repository] docs for directory layout, Podman Compose with live reload, dev mode, and more.
 
-== Create Content with AI
+## Documentation
 
-The https://github.com/rhpds/rhdp-skills-marketplace[RHDP Skills Marketplace] provides skills for Cursor IDE and Claude Code that generate labs, demos, and validate content against Red Hat standards.
+This workshop is based on [Antora](https://antora.org/) and [Red Hat scholars template](https://github.com/redhat-scholars/courseware-template) to build HTML based tutorials.
 
-See the https://rhpds.github.io/showroom_template_nookbag/modules/content-repo.html#_creating_content_with_ai_tools[AI Tools documentation] for details.
+To run this workshop in your own environment, follow the step by step tutorial link for your cluster available below:
+
+https://bmeklund.github.io/openshift-database-tutorial/

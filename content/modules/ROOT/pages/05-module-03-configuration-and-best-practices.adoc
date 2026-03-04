@@ -1,0 +1,466 @@
+= Module 3: Configuration and best practices
+
+include::partial$_attributes.adoc[]
+
+DataStore Inc's leadership has signed off on the migration. The deployment from Module 2 proves the architecture works, but the CTO has one more requirement before production traffic is redirected: "I need resource guarantees so it doesn't starve under load, a credential rotation procedure, and a backup I can actually restore."
+
+In this module, you will tune the StatefulSet resource configuration and probe thresholds for production load, rotate the database password safely, and take a storage-level VolumeSnapshot backup.
+
+== Learning objectives
+
+By the end of this module, you will be able to:
+
+* Configure resource requests and limits so PostgreSQL gets predictable CPU and memory on a shared cluster node
+* Tune readiness and liveness probe thresholds to avoid false restarts under transient load
+* Rotate database credentials without data loss by updating the running database before updating the Kubernetes Secret
+* Create a VolumeSnapshot backup of the PostgreSQL data volume and verify it is ready for restore
+
+[#exercise-1-tune-resources-and-health-check-probes]
+== Exercise 1: Tune resources and health check probes
+
+The resource configuration from Module 2 uses conservative defaults. DataStore Inc's retail analytics workload runs batch aggregation queries every hour that spike CPU briefly — the 500m CPU request throttles those queries. The readiness probe also needs more time to avoid restarting a healthy pod that is slow to start on a busy node.
+
+. Check the current resource configuration on the running StatefulSet:
++
+[source,bash]
+----
+oc get statefulset postgres -n {user}-database \
+  -o jsonpath='cpu_request={.spec.template.spec.containers[0].resources.requests.cpu}{"\n"}mem_request={.spec.template.spec.containers[0].resources.requests.memory}{"\n"}cpu_limit={.spec.template.spec.containers[0].resources.limits.cpu}{"\n"}mem_limit={.spec.template.spec.containers[0].resources.limits.memory}{"\n"}'
+----
++
+[source,text]
+----
+cpu_request=500m
+mem_request=1Gi
+cpu_limit=2000m
+mem_limit=4Gi
+----
+
+. Check the current readiness probe settings:
++
+[source,bash]
+----
+oc get statefulset postgres -n {user}-database \
+  -o jsonpath='initialDelaySeconds={.spec.template.spec.containers[0].readinessProbe.initialDelaySeconds}{"\n"}failureThreshold={.spec.template.spec.containers[0].readinessProbe.failureThreshold}{"\n"}periodSeconds={.spec.template.spec.containers[0].readinessProbe.periodSeconds}{"\n"}'
+----
++
+[source,text]
+----
+initialDelaySeconds=15
+failureThreshold=3
+periodSeconds=10
+----
++
+The current `initialDelaySeconds: 15` and `failureThreshold: 3` give PostgreSQL only 45 seconds to become ready before Kubernetes restarts the container. On a busy node with competing workloads, PostgreSQL initialization can exceed that window.
+
+. Apply the production-tuned StatefulSet. The key changes from Module 2 are:
++
+--
+* CPU request raised from 500m to 1000m — guarantees 1 vCPU for batch aggregation queries
+* Memory request raised from 1Gi to 2Gi — supports a `shared_buffers` configuration suitable for a 2Gi allocation
+* `readinessProbe.initialDelaySeconds` raised from 15 to 20 — reduces false failures on busy nodes
+* `readinessProbe.failureThreshold` raised from 3 to 6 — tolerates 60 seconds of transient slowness before restarting
+* `livenessProbe.failureThreshold` set explicitly to 3 — kills a truly hung process after 30 seconds
+--
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: {user}-database
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+      - name: postgres
+        image: registry.redhat.io/rhel9/postgresql-{postgresql_version}:latest
+        env:
+        - name: POSTGRESQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_USER
+        - name: POSTGRESQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_PASSWORD
+        - name: POSTGRESQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_DATABASE
+        ports:
+        - containerPort: 5432
+          name: postgres
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        readinessProbe:
+          exec:
+            command:
+            - /usr/libexec/check-container
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 6
+        livenessProbe:
+          exec:
+            command:
+            - /usr/libexec/check-container
+            - --live
+          initialDelaySeconds: 120
+          periodSeconds: 10
+          failureThreshold: 3
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/pgsql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      storageClassName: gp3-csi-retain
+      resources:
+        requests:
+          storage: 10Gi
+EOF
+----
++
+[source,text]
+----
+statefulset.apps/postgres configured
+----
+
+. Watch the rolling update complete:
++
+[source,bash]
+----
+oc rollout status statefulset/postgres -n {user}-database
+----
++
+[source,text]
+----
+Waiting for 1 pods to be ready...
+statefulset rolling update complete 1 pods at revision postgres-xxxxxxxxxx...
+----
+
+=== Verify
+
+Confirm the new resource configuration is live on the running pod:
+
+[source,bash]
+----
+oc get pod postgres-0 -n {user}-database \
+  -o jsonpath='cpu_request={.spec.containers[0].resources.requests.cpu}{"\n"}mem_request={.spec.containers[0].resources.requests.memory}{"\n"}cpu_limit={.spec.containers[0].resources.limits.cpu}{"\n"}mem_limit={.spec.containers[0].resources.limits.memory}{"\n"}'
+----
+
+[source,text]
+----
+cpu_request=1000m
+mem_request=2Gi
+cpu_limit=2000m
+mem_limit=4Gi
+----
+
+The pod is now guaranteed 1 vCPU and 2Gi RAM, with burst headroom to 2 vCPUs and 4Gi RAM. Move on to Exercise 2 to rotate the database credentials.
+
+[#exercise-2-rotate-database-credentials]
+== Exercise 2: Rotate database credentials
+
+DataStore Inc's security policy requires all database passwords to be rotated every 90 days. Credential rotation on OpenShift requires 2 steps in the correct order: update the password inside the running PostgreSQL database first, then update the Kubernetes Secret, then restart the pod. Reversing the order causes the restarted pod to fail authentication.
+
+. Inspect the current password stored in the Secret:
++
+[source,bash]
+----
+oc get secret postgres-credentials -n {user}-database \
+  -o jsonpath='{.data.POSTGRESQL_PASSWORD}' | base64 -d && echo ""
+----
++
+[source,text]
+----
+DataStore2024!
+----
+
+. Update the PostgreSQL user password inside the running database. The database must accept the new password before the pod is restarted:
++
+[source,bash]
+----
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod \
+  -c "ALTER USER datastore_app WITH PASSWORD 'DataStore2025!';"
+----
++
+[source,text]
+----
+ALTER ROLE
+----
++
+[IMPORTANT]
+====
+Always update the PostgreSQL password in the database *before* updating the Secret. If you update the Secret first and restart the pod before the database password is changed, the pod will fail to authenticate and enter a crash loop.
+====
+
+. Update the Kubernetes Secret with the new password. The `--dry-run=client -o yaml | oc apply -f -` pattern updates an existing Secret without failing if it already exists:
++
+[source,bash]
+----
+oc create secret generic postgres-credentials \
+  --from-literal=POSTGRESQL_USER=datastore_app \
+  --from-literal=POSTGRESQL_PASSWORD=DataStore2025! \
+  --from-literal=POSTGRESQL_DATABASE=datastore_prod \
+  -n {user}-database \
+  --dry-run=client -o yaml | oc apply -f -
+----
++
+[source,text]
+----
+secret/postgres-credentials configured
+----
+
+. Restart the pod so it starts with the new Secret value:
++
+[source,bash]
+----
+oc delete pod postgres-0 -n {user}-database
+----
++
+[source,text]
+----
+pod "postgres-0" deleted
+----
+
+. Watch the StatefulSet recreate the pod:
++
+[source,bash]
+----
+oc get pods -w -n {user}-database
+----
++
+[source,text]
+----
+NAME         READY   STATUS              RESTARTS   AGE
+postgres-0   0/1     ContainerCreating   0          5s
+postgres-0   0/1     Running             0          15s
+postgres-0   1/1     Running             0          35s
+----
++
+Press `Ctrl+C` when `postgres-0` shows `1/1 Running`.
+
+=== Verify
+
+Confirm the pod connects with the rotated credentials and that the data survived the restart:
+
+[source,bash]
+----
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod \
+  -c "SELECT current_user, current_database(), COUNT(*) AS products FROM products;"
+----
+
+[source,text]
+----
+ current_user | current_database | products
+--------------+------------------+----------
+ datastore_app | datastore_prod   |        4
+(1 row)
+----
+
+The connection succeeds with the new password. All 4 products from Module 2 are still present. Move on to Exercise 3 to take a storage-level backup.
+
+[#exercise-3-take-a-volumesnapshot-backup]
+== Exercise 3: Take a VolumeSnapshot backup
+
+DataStore Inc's current backup approach uses `pg_dump` on a cron schedule with no coordination with storage writes. A VolumeSnapshot captures a point-in-time, crash-consistent image of the entire PVC at the storage layer in seconds — no SSH, no dump file, no cron timing issues.
+
+. List the available VolumeSnapshotClasses on the cluster:
++
+[source,bash]
+----
+oc get volumesnapshotclass
+----
++
+[source,text]
+----
+NAME          DRIVER            DELETIONPOLICY   AGE
+csi-aws-vsc   ebs.csi.aws.com   Delete           30d
+----
++
+[NOTE]
+====
+The VolumeSnapshotClass name depends on your storage provider. AWS EBS uses `csi-aws-vsc`. OpenShift Data Foundation uses `ocs-storagecluster-rbdplugin-snapclass`. Note the name from your output — you will use it in the next step.
+====
+
+. Issue a `CHECKPOINT` inside PostgreSQL before taking the snapshot. This flushes all in-flight writes from memory to disk, making the snapshot application-consistent rather than just crash-consistent:
++
+[source,bash]
+----
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod -c "CHECKPOINT;"
+----
++
+[source,text]
+----
+CHECKPOINT
+----
+
+. Create the VolumeSnapshot. Replace `csi-aws-vsc` with the VolumeSnapshotClass from your cluster if it differs:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: postgres-backup-manual
+  namespace: {user}-database
+  labels:
+    app: postgres
+    type: manual-backup
+spec:
+  volumeSnapshotClassName: csi-aws-vsc
+  source:
+    persistentVolumeClaimName: data-postgres-0
+EOF
+----
++
+[source,text]
+----
+volumesnapshot.snapshot.storage.k8s.io/postgres-backup-manual created
+----
+
+. Watch the snapshot become ready. The `READYTOUSE` column must show `true` before the snapshot can be used for restore:
++
+[source,bash]
+----
+oc get volumesnapshot postgres-backup-manual -n {user}-database -w
+----
++
+[source,text]
+----
+NAME                     READYTOUSE   SOURCEPVC        RESTORESIZE   SNAPSHOTCLASS   AGE
+postgres-backup-manual   false        data-postgres-0   10Gi          csi-aws-vsc     5s
+postgres-backup-manual   true         data-postgres-0   10Gi          csi-aws-vsc     18s
+----
++
+Press `Ctrl+C` when `READYTOUSE` shows `true`.
+
+=== Verify
+
+Inspect the completed snapshot:
+
+[source,bash]
+----
+oc describe volumesnapshot postgres-backup-manual -n {user}-database
+----
+
+[source,text]
+----
+Name:         postgres-backup-manual
+Namespace:    {user}-database
+Labels:       app=postgres
+              type=manual-backup
+Spec:
+  Source:
+    Persistent Volume Claim Name:  data-postgres-0
+  Volume Snapshot Class Name:      csi-aws-vsc
+Status:
+  Bound Volume Snapshot Content Name:  snapcontent-a1b2c3d4-0000-0000-0000-000000000000
+  Creation Time:                       2026-03-03T10:30:00Z
+  Ready To Use:                        true
+  Restore Size:                        10Gi
+----
+
+`Ready To Use: true` and `Restore Size: 10Gi` confirm the snapshot is complete. To restore from this snapshot, you create a new PVC with `dataSource.kind: VolumeSnapshot` pointing to `postgres-backup-manual` — the new PVC is pre-populated with all data as of the checkpoint.
+
+== Troubleshooting
+
+*Issue*: `oc rollout status` hangs after the StatefulSet update
+
+*Solution*:
+
+. Check if the pod is stuck in `Pending` due to insufficient node resources:
++
+[source,bash]
+----
+oc describe pod postgres-0 -n {user}-database | grep -A 5 "Events:"
+----
+. If you see `Insufficient cpu` or `Insufficient memory`, the node does not have enough free capacity. Reduce the `cpu` or `memory` request in the StatefulSet spec and reapply.
+
+*Issue*: `psql` connection fails after the credential rotation
+
+*Solution*:
+
+. Verify the password currently in the Secret matches what you set in the database:
++
+[source,bash]
+----
+oc get secret postgres-credentials -n {user}-database \
+  -o jsonpath='{.data.POSTGRESQL_PASSWORD}' | base64 -d && echo ""
+----
+. If the Secret still shows the old password, the `oc apply` in step 3 did not succeed. Re-run the `oc create secret --dry-run=client | oc apply` command and check for errors.
+
+*Issue*: `oc get volumesnapshotclass` returns `No resources found`
+
+*Solution*:
+
+. The VolumeSnapshot API may not be installed. Check whether the API group is registered:
++
+[source,bash]
+----
+oc api-resources | grep volumesnapshot
+----
+. If no resources appear, the CSI external-snapshotter is not deployed on this cluster. Ask your facilitator to enable VolumeSnapshot support.
+
+*Issue*: VolumeSnapshot stays `READYTOUSE: false` for more than 2 minutes
+
+*Solution*:
+
+. Check the VolumeSnapshotContent object for errors:
++
+[source,bash]
+----
+oc describe volumesnapshotcontent \
+  $(oc get volumesnapshot postgres-backup-manual -n {user}-database \
+    -o jsonpath='{.status.boundVolumeSnapshotContentName}')
+----
+. The most common cause is a `volumeSnapshotClassName` that does not match any installed class. Re-check `oc get volumesnapshotclass` and update the VolumeSnapshot spec.
+
+== Module summary
+
+DataStore Inc's PostgreSQL deployment is now hardened for production use. The working deployment from Module 2 has resource guarantees, tuned health probes, a documented credential rotation procedure, and a verified point-in-time backup.
+
+*What you accomplished:*
+
+* Raised CPU and memory requests to guarantee PostgreSQL {postgresql_version} the resources DataStore Inc's batch analytics workload requires
+* Tuned readiness probe thresholds to give PostgreSQL more startup time on busy nodes without triggering unnecessary container restarts
+* Rotated the database password safely by updating PostgreSQL first, then the Secret, then restarting the pod — in the correct order to prevent authentication failures
+* Issued a `CHECKPOINT` and took a VolumeSnapshot backup verified as `Ready To Use: true`
+
+*Key takeaways:*
+
+* Always update the PostgreSQL password inside the database before updating the Kubernetes Secret — reversing the order causes the restarted pod to fail authentication and crash loop
+* `terminationGracePeriodSeconds: 60` and a pre-snapshot `CHECKPOINT` are complementary: the grace period handles planned pod shutdowns cleanly, and `CHECKPOINT` makes storage snapshots application-consistent
+* VolumeSnapshots are storage-level — they capture the entire PVC, not a single database or table. Use them alongside `pg_dump` when you need granular logical backups of individual tables
+* Set `readinessProbe.failureThreshold` high enough that transient node pressure does not restart a healthy database — every container restart interrupts all active client connections
+
+*Next steps:*
+
+Module 4 tests DataStore Inc's deployment against a simulated node failure. You will add a PodDisruptionBudget to protect against eviction during cluster maintenance, observe OpenShift's automated pod rescheduling, and confirm that persistent storage survives a full node drain.

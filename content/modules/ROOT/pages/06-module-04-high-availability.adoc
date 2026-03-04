@@ -1,0 +1,434 @@
+= Module 4: High availability
+
+include::partial$_attributes.adoc[]
+
+DataStore Inc's CTO has one final question before signing off on the production cutover: "What happens when a node goes down during business hours? Do we lose data? Does someone have to call the DBA at 2 AM?"
+
+In this module, you will add a PodDisruptionBudget to protect the database from eviction during cluster maintenance, simulate a pod crash and observe automated recovery, and restore data from the VolumeSnapshot taken in Module 3 to prove the backup is viable.
+
+== Learning objectives
+
+By the end of this module, you will be able to:
+
+* Create a PodDisruptionBudget to prevent OpenShift from evicting the database pod during node drains and cluster upgrades
+* Verify that the StatefulSet controller automatically reschedules a crashed database pod with the same PVC attached
+* Restore data from a VolumeSnapshot by provisioning a new PVC from the snapshot and querying it with a verification pod
+* Explain the difference between voluntary disruptions (node drains) and involuntary disruptions (crashes) and how OpenShift handles each
+
+[#exercise-1-protect-the-database-with-a-poddisruptionbudget]
+== Exercise 1: Protect the database with a PodDisruptionBudget
+
+During a cluster upgrade, OpenShift drains nodes one at a time — evicting pods before patching the node OS. Without a PodDisruptionBudget, OpenShift can evict the database pod at any time, causing an unplanned outage. A PDB with `minAvailable: 1` tells the cluster scheduler: do not evict this pod if doing so would leave fewer than 1 replica running.
+
+. Confirm no PodDisruptionBudget exists in the namespace yet:
++
+[source,bash]
+----
+oc get pdb -n {user}-database
+----
++
+[source,text]
+----
+No resources found in {user}-database namespace.
+----
+
+. Create the PodDisruptionBudget targeting the `app: postgres` label:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-pdb
+  namespace: {user}-database
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: postgres
+EOF
+----
++
+[source,text]
+----
+poddisruptionbudget.policy/postgres-pdb created
+----
+
+. Review the PDB status:
++
+[source,bash]
+----
+oc get pdb postgres-pdb -n {user}-database
+----
++
+[source,text]
+----
+NAME           MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+postgres-pdb   1               N/A               0                     30s
+----
++
+`ALLOWED DISRUPTIONS: 0` means OpenShift cannot voluntarily evict any replica right now — the single running pod already equals the minimum. With 2 replicas and `minAvailable: 1`, this field would show `1`, allowing 1 replica to be evicted at a time during a node drain.
++
+[NOTE]
+====
+A PodDisruptionBudget only protects against *voluntary* disruptions: node drains, cluster upgrades, and manual evictions. It cannot prevent *involuntary* disruptions such as hardware failures, OOM kills, or kernel panics — those are handled by the StatefulSet controller's automatic pod replacement, which you will test in Exercise 2.
+====
+
+=== Verify
+
+Confirm the PDB is targeting the correct pods and reporting the correct counts:
+
+[source,bash]
+----
+oc describe pdb postgres-pdb -n {user}-database
+----
+
+[source,text]
+----
+Name:           postgres-pdb
+Namespace:      {user}-database
+Min available:  1
+Selector:       app=postgres
+Status:
+    Allowed disruptions:  0
+    Current:              1
+    Desired:              1
+    Total:                1
+Events:                   <none>
+----
+
+`Current: 1`, `Desired: 1`, `Allowed disruptions: 0` — the PDB is active and protecting `postgres-0`. Move on to Exercise 2 to test automated recovery from a pod crash.
+
+[#exercise-2-simulate-a-pod-crash-and-verify-automated-recovery]
+== Exercise 2: Simulate a pod crash and verify automated recovery
+
+The PDB protects against voluntary evictions. The StatefulSet controller handles involuntary crashes — hardware failures, OOM kills, process crashes — by scheduling a replacement pod that mounts the same PVC.
+
+You will simulate a crash by deleting the pod and observe the StatefulSet controller recreating it immediately.
+
+. Record the current state before the crash:
++
+[source,bash]
+----
+oc get pod postgres-0 -n {user}-database \
+  -o jsonpath='Pod created: {.metadata.creationTimestamp}{"\n"}'
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod \
+  -c "SELECT COUNT(*) AS products FROM products;"
+----
++
+[source,text]
+----
+Pod created: 2026-03-03T10:35:00Z
+
+ products
+----------
+        4
+(1 row)
+----
+
+. Delete the pod to simulate a crash. The StatefulSet controller detects the missing pod immediately and schedules a replacement:
++
+[source,bash]
+----
+oc delete pod postgres-0 -n {user}-database
+----
++
+[source,text]
+----
+pod "postgres-0" deleted
+----
+
+. Watch the StatefulSet recreate the pod with the same PVC attached:
++
+[source,bash]
+----
+oc get pods -w -n {user}-database
+----
++
+[source,text]
+----
+NAME         READY   STATUS              RESTARTS   AGE
+postgres-0   0/1     Pending             0          2s
+postgres-0   0/1     ContainerCreating   0          4s
+postgres-0   0/1     Running             0          12s
+postgres-0   1/1     Running             0          27s
+----
++
+Press `Ctrl+C` when `postgres-0` shows `1/1 Running`.
+
+. Confirm the replacement pod has a later creation time than the original, proving it is a newly scheduled pod:
++
+[source,bash]
+----
+oc get pod postgres-0 -n {user}-database \
+  -o jsonpath='Pod created: {.metadata.creationTimestamp}{"\n"}'
+----
++
+[source,text]
+----
+Pod created: 2026-03-03T10:40:00Z
+----
+
+=== Verify
+
+Query the products table to confirm all data survived the pod crash:
+
+[source,bash]
+----
+oc exec postgres-0 -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod \
+  -c "SELECT id, sku, name FROM products ORDER BY id;"
+----
+
+[source,text]
+----
+ id |  sku   |         name
+----+--------+----------------------
+  1 | DS-001 | Wireless Headphones
+  2 | DS-002 | USB-C Hub 7-Port
+  3 | DS-003 | Mechanical Keyboard
+  4 | DS-004 | Webcam HD 1080p
+(4 rows)
+----
+
+All 4 products are intact. The replacement pod mounted the same `data-postgres-0` PVC and PostgreSQL replayed the WAL to reach a consistent state — no manual intervention required. Move on to Exercise 3 to verify the snapshot backup from Module 3 is restorable.
+
+[#exercise-3-restore-from-the-volumesnapshot-backup]
+== Exercise 3: Restore from the VolumeSnapshot backup
+
+A backup that has never been tested is not a backup. In this exercise, you will provision a new PVC from the `postgres-backup-manual` snapshot created in Module 3, start a temporary PostgreSQL pod using that PVC, and confirm the data is present. This proves the full backup-restore cycle works end to end.
+
+. Confirm the snapshot from Module 3 is still ready:
++
+[source,bash]
+----
+oc get volumesnapshot postgres-backup-manual -n {user}-database
+----
++
+[source,text]
+----
+NAME                     READYTOUSE   SOURCEPVC         RESTORESIZE   SNAPSHOTCLASS   AGE
+postgres-backup-manual   true         data-postgres-0   10Gi          csi-aws-vsc     20m
+----
+
+. Create a new PVC seeded from the snapshot. The storage provisioner clones the snapshot data into the new volume before binding it:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-restore-verify
+  namespace: {user}-database
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  dataSource:
+    name: postgres-backup-manual
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+EOF
+----
++
+[source,text]
+----
+persistentvolumeclaim/postgres-restore-verify created
+----
+
+. Start a temporary verification pod using the restored PVC. The pod reads the existing data directory from the snapshot without reinitializing it:
++
+[source,bash]
+----
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-restore-verify
+  namespace: {user}-database
+  labels:
+    app: postgres-restore
+spec:
+  restartPolicy: Never
+  containers:
+  - name: postgres
+    image: registry.redhat.io/rhel9/postgresql-{postgresql_version}:latest
+    env:
+    - name: POSTGRESQL_USER
+      valueFrom:
+        secretKeyRef:
+          name: postgres-credentials
+          key: POSTGRESQL_USER
+    - name: POSTGRESQL_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: postgres-credentials
+          key: POSTGRESQL_PASSWORD
+    - name: POSTGRESQL_DATABASE
+      valueFrom:
+        secretKeyRef:
+          name: postgres-credentials
+          key: POSTGRESQL_DATABASE
+    volumeMounts:
+    - name: restore-data
+      mountPath: /var/lib/pgsql/data
+  volumes:
+  - name: restore-data
+    persistentVolumeClaim:
+      claimName: postgres-restore-verify
+EOF
+----
++
+[source,text]
+----
+pod/postgres-restore-verify created
+----
+
+. Wait for the verification pod to become ready:
++
+[source,bash]
+----
+oc get pod postgres-restore-verify -n {user}-database -w
+----
++
+[source,text]
+----
+NAME                      READY   STATUS    RESTARTS   AGE
+postgres-restore-verify   0/1     Running   0          15s
+postgres-restore-verify   1/1     Running   0          30s
+----
++
+Press `Ctrl+C` when `1/1 Running`.
+
+. Query the restored database to confirm all products are present from the backup point:
++
+[source,bash]
+----
+oc exec postgres-restore-verify -n {user}-database -- \
+  psql -U datastore_app -d datastore_prod \
+  -c "SELECT id, sku, name FROM products ORDER BY id;"
+----
++
+[source,text]
+----
+ id |  sku   |         name
+----+--------+----------------------
+  1 | DS-001 | Wireless Headphones
+  2 | DS-002 | USB-C Hub 7-Port
+  3 | DS-003 | Mechanical Keyboard
+  4 | DS-004 | Webcam HD 1080p
+(4 rows)
+----
+
+. Clean up the verification pod and PVC — the production database is unaffected:
++
+[source,bash]
+----
+oc delete pod postgres-restore-verify -n {user}-database
+oc delete pvc postgres-restore-verify -n {user}-database
+----
++
+[source,text]
+----
+pod "postgres-restore-verify" deleted
+persistentvolumeclaim "postgres-restore-verify" deleted
+----
+
+=== Verify
+
+Confirm the production database, its PVC, and the PDB are all healthy after the restore exercise:
+
+[source,bash]
+----
+oc get pod,pvc,pdb -n {user}-database
+----
+
+[source,text]
+----
+NAME             READY   STATUS    RESTARTS   AGE
+pod/postgres-0   1/1     Running   0          8m
+
+NAME                                        STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+persistentvolumeclaim/data-postgres-0       Bound    pvc-a1b2c3d4-0000-0000-0000-000000000000   10Gi       RWO            gp3-csi        55m
+
+NAME                                      MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+poddisruptionbudget.policy/postgres-pdb   1               N/A               0                     15m
+----
+
+The production database is running, the PVC is bound, and the PDB is protecting the pod. DataStore Inc's PostgreSQL deployment on OpenShift is production-ready.
+
+== Troubleshooting
+
+*Issue*: Pod replacement after deletion takes more than 2 minutes
+
+*Solution*:
+
+. Check whether the PVC is still bound — a stuck PVC prevents the new pod from starting:
++
+[source,bash]
+----
+oc get pvc data-postgres-0 -n {user}-database
+----
+. If the PVC status is not `Bound`, check `oc describe pvc data-postgres-0` for volume attachment errors. The most common cause is that the node where the original pod ran is unreachable, and the storage driver is waiting for a node fence timeout before releasing the volume attachment.
+
+*Issue*: Restore PVC stays in `Pending` after creation
+
+*Solution*:
+
+. When `VolumeBindingMode` is `WaitForFirstConsumer`, the PVC stays `Pending` until a pod is scheduled that requests the volume. This is expected — create the verification pod and the PVC will bind once the pod is placed on a node:
++
+[source,bash]
+----
+oc get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.volumeBindingMode}{"\n"}{end}'
+----
+
+*Issue*: Restore pod shows `0/1 Error` or never reaches `1/1 Running`
+
+*Solution*:
+
+. The standalone pod definition does not include the same readiness probe as the StatefulSet. Check the logs for startup errors:
++
+[source,bash]
+----
+oc logs postgres-restore-verify -n {user}-database
+----
+. A common cause is a credential mismatch: the current Secret contains the rotated password from Module 3, but the snapshot data directory was initialized with the original password. The pod will fail to authenticate. If this happens, pass the original password directly to the `psql` command with `-W` for manual verification.
+
+*Issue*: `oc delete pod postgres-0` does not trigger a replacement — pod stays gone
+
+*Solution*:
+
+. The StatefulSet must still exist for automatic replacement to work. Verify:
++
+[source,bash]
+----
+oc get statefulset postgres -n {user}-database
+----
+. If the StatefulSet is missing, recreate it from the Module 2 YAML. The existing `data-postgres-0` PVC will be automatically mounted by the new `postgres-0` pod — no data is lost.
+
+== Module summary
+
+DataStore Inc now has a production-ready PostgreSQL {postgresql_version} deployment on OpenShift. The complete workshop covered everything needed to answer the CTO's original mandate: fast provisioning, automated HA, durable storage, and verified backups.
+
+*What you accomplished:*
+
+* Created a PodDisruptionBudget with `minAvailable: 1` that prevents OpenShift from evicting the database pod during node drains and cluster upgrades
+* Simulated a pod crash and confirmed the StatefulSet controller immediately scheduled a replacement that mounted the same PVC and recovered all 4 products
+* Provisioned a new PVC from the `postgres-backup-manual` VolumeSnapshot, started a verification pod, and queried the data to prove the backup is restorable
+* Confirmed the production database, PVC, and PDB are all healthy after the HA exercises
+
+*Key takeaways:*
+
+* A PDB with `minAvailable: 1` on a single-replica StatefulSet sets `ALLOWED DISRUPTIONS: 0` — OpenShift cannot voluntarily evict the pod at all. Run 2 replicas with `minAvailable: 1` to allow rolling maintenance while keeping 1 replica always available
+* PDBs protect against voluntary disruptions. StatefulSet automatic replacement handles involuntary disruptions. Both are required for a complete HA story
+* VolumeSnapshot restores work by provisioning a new PVC with a `dataSource` pointing to the snapshot — no restore script, no manual copy. The storage layer clones the data before the PVC is bound
+* Always test your restore path before you need it. A backup verified in this exercise is a backup you can trust in production
+
+*Next steps:*
+
+For production-grade PostgreSQL HA with automatic primary election, streaming replication, connection pooling, and operator-managed backups, evaluate the Crunchy Data PGO operator — which was shown as installed on your cluster in Module 1. PGO automates the entire HA topology that requires manual configuration with standalone StatefulSets.

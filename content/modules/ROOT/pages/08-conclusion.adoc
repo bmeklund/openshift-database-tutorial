@@ -1,0 +1,147 @@
+= Workshop conclusion
+
+include::partial$_attributes.adoc[]
+
+DataStore Inc's migration is complete.
+
+Four modules ago, the CTO issued a mandate: modernize the database infrastructure or continue paying for slow provisioning, wasted reserved capacity, manual failover, and fragile cron-based backups. Today you have delivered a production-ready PostgreSQL {postgresql_version} deployment on OpenShift that addresses every item on that list.
+
+Database provisioning time dropped from 2 to 3 weeks to under 5 minutes. Failover is automated — no DBA on-call required. Storage-level backups replace pg_dump cron jobs. And the entire deployment is defined in YAML that can be version-controlled, reviewed, and reproduced.
+
+== What you learned
+
+=== Module 1: Databases on OpenShift vs. VMs
+
+You built the foundation for the migration by understanding why the architecture changes and what that means operationally.
+
+* Explored the OpenShift storage landscape and identified StorageClasses suitable for database workloads — `gp3-csi` for day-to-day operations and `gp3-csi-retain` for production databases where accidental PVC deletion must not destroy data
+* Documented the architectural differences between VM-based and containerized PostgreSQL, including the 2-5% CSI I/O overhead that is acceptable for OLAP workloads and the cases where local NVMe StorageClasses are worth evaluating
+* Reviewed the 4 core OpenShift primitives — StatefulSet, Service, Secret, and PodDisruptionBudget — and when each one is required for a production database workload
+* Confirmed that DataStore Inc's 3-worker-node cluster meets the requirements for HA database deployments with anti-affinity rules
+
+=== Module 2: Deploy and connect PostgreSQL
+
+You moved from theory to a running database with durable storage and verified that the most important property holds: data survives pod restarts.
+
+* Created a Kubernetes Secret to store database credentials and inject them as environment variables — no passwords in YAML, no manual file edits inside the container
+* Deployed PostgreSQL {postgresql_version} using a StatefulSet with a `volumeClaimTemplates` section that automatically provisions a 10Gi PVC named `data-postgres-0`
+* Created a headless Service providing the stable DNS name `postgres-0.postgres.{user}-database.svc.cluster.local` that other pods use to connect
+* Ran SQL queries via `oc exec` to create the `products` schema and insert 4 DataStore Inc inventory records
+* Deleted the pod and confirmed all 4 rows survived the restart — proving that PVC-backed storage is durable independent of pod lifecycle
+* Deployed PostgreSQL using the CloudNativePG operator with a single `Cluster` custom resource, observing how the operator automates pod management, Service creation, PVC provisioning, and certificate management
+
+=== Module 3: Configuration and best practices
+
+You hardened the working deployment with production-grade resource guarantees, a tested credential rotation procedure, and a storage-level backup.
+
+* Raised CPU requests from 500m to 1000m and memory from 1Gi to 2Gi to guarantee DataStore Inc's batch analytics workload gets the resources it needs
+* Tuned `readinessProbe.failureThreshold` from 3 to 6 to prevent false-positive container restarts on nodes with transient load spikes
+* Rotated the database password by updating PostgreSQL first with `ALTER USER`, then updating the Secret, then restarting the pod — establishing the order that prevents authentication failures during rotation
+* Issued a `CHECKPOINT` and took a VolumeSnapshot that completed with `Ready To Use: true`, replacing the pg_dump cron job with a storage-level point-in-time backup
+
+=== Module 4: High availability
+
+You tested the deployment against failure scenarios and verified the backup is restorable — the 2 questions every production database team must be able to answer.
+
+* Created a PodDisruptionBudget with `minAvailable: 1` that sets `ALLOWED DISRUPTIONS: 0` on the single-replica deployment, preventing OpenShift from evicting the database pod during cluster upgrades or node drains
+* Simulated a pod crash by deleting `postgres-0` and observed the StatefulSet controller schedule a replacement that mounted the same PVC and recovered all data without intervention
+* Provisioned a new PVC from the Module 3 VolumeSnapshot using the `dataSource` field, started a verification pod, and confirmed all 4 products are present — proving the backup can be restored
+
+=== Module 5: Connecting applications to databases
+
+You completed the full-stack picture by deploying a stateless analytics API alongside the stateful database, then exercised the application lifecycle from scaling to rolling updates to reconnection recovery.
+
+* Deployed the DataStore Inc analytics API as a stateless `Deployment` with 2 replicas, injecting the `postgres-credentials` Secret as environment variables and connecting via the `postgres` Service DNS name — no passwords in YAML, no hardcoded hostnames
+* Verified that both replicas resolved DNS correctly, read from the products table, and wrote a new product record — confirming the full read/write path from application tier to database tier
+* Scaled the Deployment to 4 replicas with a single command, with no database configuration change required — demonstrating the core operational advantage of stateless application design
+* Deployed API v2 with a zero-downtime rolling update using `maxUnavailable: 0`, observed the application automatically reconnect after a simulated database pod restart, and confirmed rollback with `oc rollout undo`
+* Mapped the DR implications of each tier: the stateless API recovers via traffic redirection (seconds), while the database requires storage recovery — either backup/restore from a VolumeSnapshot or ODF Regional-DR replication for lower RPO
+* Added a Red Hat Data Grid caching layer to the analytics API using the cache-aside pattern: the API checks Data Grid first on each poll, queries PostgreSQL only on a cache miss, and writes the result back to the cache with a 60-second TTL
+
+== Business outcomes for DataStore Inc
+
+The migration delivers on all 5 pain points identified at the start:
+
+[cols="1,1,1", options="header"]
+|===
+|Pain point
+|Before (VM-based)
+|After (OpenShift)
+
+|Provisioning time
+|2-3 weeks per instance
+|Under 5 minutes from YAML to running database
+
+|Resource utilization
+|16 GB RAM and 8 vCPUs reserved per VM, 60% idle
+|Requests and limits with bin-packing — unused cycles shared with other workloads
+
+|High availability
+|Manual standby VM, 15-30 minute RTO, DBA on-call
+|StatefulSet automatic replacement with PodDisruptionBudget protection
+
+|Backup management
+|pg_dump via cron, no storage coordination
+|VolumeSnapshot after `CHECKPOINT`, ready to restore in minutes
+
+|Developer self-service
+|Ticket-based, days of wait time per environment
+|YAML apply, namespace-scoped, no DBA intervention required
+|===
+
+== Key principles to carry forward
+
+These 6 principles apply to every PostgreSQL workload you deploy on OpenShift after this workshop:
+
+* *Always create the Secret before the StatefulSet* — the pod fails to start if a referenced Secret does not exist
+* *Set `terminationGracePeriodSeconds: 60` on every database StatefulSet* — it gives PostgreSQL time to write its checkpoint before the pod is killed during a planned shutdown
+* *Use `RECLAIMPOLICY: Retain` StorageClasses for production databases* — the default `Delete` policy destroys PVC data when the PVC object is removed
+* *Update the database password before the Secret during credential rotation* — reversing the order causes the restarted pod to fail authentication
+* *Issue `CHECKPOINT` before every VolumeSnapshot* — it makes the snapshot application-consistent, not just crash-consistent
+* *Test your restore path before you need it* — a backup that has never been restored is an untested assumption
+
+== What to explore next
+
+=== Operator-managed PostgreSQL for production HA
+
+The Crunchy PostgreSQL Operator (PGO) was installed on your cluster in Module 1. PGO automates the complete HA topology — primary election, streaming replication to standby replicas, automatic failover, connection pooling via pgBouncer, and incremental backups with pgBackRest. A single `PostgresCluster` custom resource replaces the StatefulSet, Service, Secret, and PodDisruptionBudget you configured manually in this workshop.
+
+=== Storage expansion
+
+The PVC created in Module 2 is 10Gi. The `gp3-csi` StorageClass has `ALLOWVOLUMEEXPANSION: true`, which means you can expand the PVC online with `oc patch pvc data-postgres-0 -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'` — no downtime, no data migration.
+
+=== Monitoring and alerting
+
+OpenShift includes a built-in Prometheus and Alertmanager stack. Deploy the `postgres_exporter` sidecar alongside the PostgreSQL container to expose metrics like `pg_up`, `pg_stat_activity_count`, and `pg_database_size_bytes` to the cluster's monitoring system.
+
+=== CloudNativePG for production PostgreSQL
+
+CloudNativePG is the CNCF-hosted PostgreSQL operator used in Exercise 4 of Module 2. In production deployments, increase `instances` to 3 or more to enable built-in high availability with automatic primary election and streaming replication to standby replicas. The operator also manages WAL archiving to object storage (S3-compatible), automated failover without DBA intervention, and connection pooling via the integrated PgBouncer support. See the link:https://cloudnative-pg.io/documentation/[CloudNativePG documentation^] for the full API reference.
+
+=== Red Hat Data Grid for distributed caching
+
+The cache-aside pattern in Exercise 4 of Module 5 uses a single Data Grid replica, which is sufficient for a workshop. In production, increase `replicas` to 3 or more to distribute the cache across nodes and eliminate the single point of failure. Red Hat Data Grid also supports the HotRod protocol for native Java, .NET, and C++ clients, cross-site replication for multi-region disaster recovery, and near-cache mode for client-side caching of frequently accessed entries. See the link:https://docs.redhat.com/en/documentation/red_hat_data_grid/8.5[Red Hat Data Grid 8.5 documentation^] for configuration details.
+
+== References
+
+=== OpenShift documentation
+
+* link:https://docs.redhat.com/en/documentation/openshift_container_platform/{ocp_version}/html/storage/index[OpenShift {ocp_version} storage documentation^] — CSI drivers, StorageClasses, PersistentVolumes, and VolumeSnapshots
+* link:https://docs.redhat.com/en/documentation/openshift_container_platform/{ocp_version}/html/nodes/working-with-pods[OpenShift {ocp_version} pod documentation^] — StatefulSets, resource requests and limits, and pod lifecycle
+* link:https://docs.redhat.com/en/documentation/openshift_container_platform/{ocp_version}/html/security_and_compliance/index[OpenShift {ocp_version} security documentation^] — Secrets management, Security Context Constraints
+
+=== PostgreSQL and operator documentation
+
+* link:https://www.postgresql.org/docs/16/index.html[PostgreSQL {postgresql_version} documentation^] — official PostgreSQL reference, including WAL, checkpoints, and authentication
+* link:https://access.crunchydata.com/documentation/postgres-operator/latest/[Crunchy Data PGO documentation^] — production-grade PostgreSQL operator for OpenShift with HA, backups, and connection pooling
+
+=== Kubernetes references
+
+* link:https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/[Kubernetes StatefulSets^] — stable network identity, ordered pod management, and `volumeClaimTemplates`
+* link:https://kubernetes.io/docs/concepts/storage/volume-snapshots/[Kubernetes VolumeSnapshots^] — point-in-time storage snapshots using the CSI snapshot API
+* link:https://kubernetes.io/docs/tasks/run-application/configure-pdb/[Kubernetes PodDisruptionBudgets^] — protecting workloads from voluntary disruptions during maintenance
+
+=== Certification paths
+
+* link:https://www.redhat.com/en/services/training/ex280-red-hat-certified-specialist-in-openshift-administration-exam[Red Hat Certified Specialist in OpenShift Administration (EX280)^] — cluster administration, storage, and stateful workloads
+* link:https://www.redhat.com/en/services/training/ex288-red-hat-certified-specialist-in-openshift-application-development-exam[Red Hat Certified Specialist in OpenShift Application Development (EX288)^] — application deployment, configuration, and secrets management on OpenShift
