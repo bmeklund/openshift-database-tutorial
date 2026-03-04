@@ -5,12 +5,16 @@ The content is built with Antora and published as a static site using the Red Ha
 
 ## Overview
 
-| | |
-|---|---|
-| **Audience Experience Level** | Beginner to Intermediate |
-| **Average Time to Complete** | 3 - 5 hours |
 
----
+|===
+| | 
+
+| *Audience Experience Level*
+| Beginner to Intermediate
+
+| *Average Time to Complete*
+| 2 - 2.5 hours
+|===
 
 ## Local development
 
