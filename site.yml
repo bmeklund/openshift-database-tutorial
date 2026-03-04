@@ -24,4 +24,4 @@ runtime:
   fetch: true
 
 output:
-  dir: ./www
+  dir: ./gh-pages
