@@ -13,7 +13,7 @@ The content is built with Antora and published as a static site using the Red Ha
 | Beginner to Intermediate
 
 | *Average Time to Complete*
-| 2 - 2.5 hours
+| 3 - 5 hours
 |===
 
 ## Local development
